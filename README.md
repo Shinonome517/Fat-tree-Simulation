@@ -1,6 +1,6 @@
-# Fat-tree-Simulation Docker イメージ（Mininet + OVS(kernel datapath) + picoquic）
+# Fat-Tree　Simulation Docker イメージ（Mininet + OVS(kernel datapath) + picoquic）
 
-このリポジトリはUbuntu 24.04 ホスト上で、**kernel datapath の Open vSwitch (ovsk)** を利用して Mininet と picoquic を動かすための Docker イメージを提供します。  
+このリポジトリはUbuntu 24.04 ホスト上で、**kernel datapath の Open vSwitch (ovsk)** を利用して Mininet と picoquic を動かすための Docker イメージと Fat-Tree に Multipath quic を適用するエミュレート用のスクリプトを提供します。  
 
 コンテナはホストのカーネルモジュールを共有する構成で起動する必要があり、`--privileged` / `--network=host` / `-v /lib/modules:/lib/modules` を付与するのが必須です。
 
@@ -35,22 +35,26 @@ docker build -t mpquic-lab .
 ## 3. コンテナ起動（推奨）
 
 ```bash
-docker run --privileged --network=host \
+docker run --name your-container-name \
+  --ulimit memlock=-1 \
+  --privileged --network=host \
   -v /lib/modules:/lib/modules \
-  -v "$(pwd)/fat_tree.py":/root/fat_tree.py \
+  -v "$PWD:/workspace" -w /workspace \
   -it mpquic-lab
 ```
 
---privileged：OVS 用
---network=host：ホストとネットワークを共有
--v /lib/modules:/lib/modules：カーネルモジュールを共有
--v "$(pwd)/fat_tree.py":/root/fat_tree.py：Fat-Tree スクリプトをマウント
+- --privileged：にコンテナへカーネル機能へのアクセス権を付与（OVS用）
+- --network=host：ホストとネットワークを共有
+- -v /lib/modules:/lib/modules：カーネルモジュールを共有
+- -v -v "$PWD:/workspace"：ホスト側カレントディレクトリを
 
 ---
 
 ## 4. コンテナ内での確認コマンド
 
 ### OVS
+
+OVSの動作確認
 
 ```sh
 ovs-vsctl show
@@ -60,13 +64,19 @@ ps aux | grep -E 'ovsdb-server|ovs-vswitchd'
 
 ### Mininet
 
+Mininetの動作確認
+
 ```sh
 sudo mn --test pingall
 ```
 
 ### picoquic
 
+picoquicが正しくビルドされているかの確認
+
 ```sh
 which picoquicdemo
 picoquicdemo -h
 ```
+
+---

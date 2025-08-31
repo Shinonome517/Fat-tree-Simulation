@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# increase memlock limit in this shell so ovs-vswitchd inherits it
+ulimit -l unlimited || true
+
 set -euo pipefail
 
 # sysctl を適用（--privileged 時に有効、失敗しても続行）
@@ -21,4 +25,11 @@ ovs-vsctl --no-wait init || true
 ovs-vswitchd --pidfile --detach
 
 echo "[entrypoint] Open vSwitch is up."
-exec "$@"
+
+if [ "$#" -eq 0 ]; then
+  echo "[entrypoint] No CMD provided; keeping container alive."
+  exec tail -f /dev/null
+else
+  exec "$@"
+fi
+
