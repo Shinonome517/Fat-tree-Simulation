@@ -20,6 +20,7 @@
 - Docker がインストール済み
 - ホストで `openvswitch` カーネルモジュールが使えること
   - `sudo modprobe openvswitch` でロード可能か確認
+  - `sudo systemctl disable --now openvswitch-switch` でホストOVSの停止も確認（OVSはコンテナ利用に限定する）
 - Docker を実行するユーザが `sudo` 権限を持っていること
 
 ---
