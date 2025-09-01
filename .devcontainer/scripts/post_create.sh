@@ -7,5 +7,6 @@ command -v ovs-vsctl    >/dev/null && ovs-vsctl --version || true
 command -v mn           >/dev/null && mn --version || true
 command -v iperf3       >/dev/null && iperf3 --version || true
 command -v picoquicdemo >/dev/null && picoquicdemo -h | head -n 1 || true
+command -v ryu-manager  >/dev/null && ryu-manager --version || echo "[postCreate] ryu-manager not found"
 
 echo "[postCreate] Done."

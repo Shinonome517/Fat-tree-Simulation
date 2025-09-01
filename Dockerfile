@@ -14,13 +14,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mininet \
     openvswitch-switch openvswitch-common \
     iproute2 iputils-ping ethtool net-tools tcpdump iperf3 \
-    python3 python3-pip \
+    python3 python3-pip python3-os-ken \
     git ca-certificates curl \
     build-essential cmake pkg-config ninja-build \
     libssl-dev \
     # あると便利な診断
     procps less vim \
  && rm -rf /var/lib/apt/lists/*
+
+# 動作確認（ビルドログ上でバージョン表示）
+RUN osken-manager --version || true
 
 # OVS/Mininet 用の sysctl（実行時に適用）
 RUN printf 'net.ipv4.ip_forward=1\nnet.core.rmem_max=268435456\nnet.core.wmem_max=268435456\n' \
