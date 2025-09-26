@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git ca-certificates curl \
     build-essential cmake pkg-config ninja-build \
     libssl-dev \
+    zsh \
     # あると便利な診断
     procps less vim \
  && rm -rf /var/lib/apt/lists/*
@@ -42,4 +43,4 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /root
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["/bin/bash"]
+CMD ["/bin/zsh"]
