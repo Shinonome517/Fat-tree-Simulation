@@ -1,5 +1,5 @@
-# Ubuntu 24.04 (noble) ベース
-FROM ubuntu:24.04
+# Ubuntu 22.04 (jammy) ベース
+FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC \
@@ -55,6 +55,14 @@ RUN ln -sf "$PICOQUIC_HOME/build/picoquicdemo" /usr/local/bin/picoquicdemo \
 # セットアップスクリプト（コンテナ起動後に devcontainer が実行）
 COPY setup.sh /usr/local/bin/setup.sh
 RUN chmod +x /usr/local/bin/setup.sh
+
+# ovs-healthcheck 用スクリプト
+COPY ovs-healthcheck.sh /usr/local/bin/ovs-healthcheck.sh
+RUN chmod +x /usr/local/bin/ovs-healthcheck.sh
+
+HEALTHCHECK --start-period=30s --interval=300s --timeout=5s --retries=3 \
+  CMD /usr/local/bin/ovs-healthcheck.sh || exit 1
+
 
 WORKDIR /root
 CMD ["/bin/zsh"]

@@ -1,6 +1,6 @@
 # Fat-Tree　Simulation Docker イメージ（Mininet + OVS(kernel datapath) + picoquic）
 
-このリポジトリはUbuntu 24.04 ホスト上で、**kernel datapath の Open vSwitch (ovsk)** を利用して Mininet と picoquic を動かすための Docker イメージと Fat-Tree に Multipath quic を適用するエミュレート用のスクリプトを提供します。  
+このリポジトリはUbuntu 22.04 ホスト上で、**kernel datapath の Open vSwitch (ovsk)** を利用して Mininet と picoquic を動かすための Docker イメージと Fat-Tree に Multipath quic を適用するエミュレート用のスクリプトを提供します。  
 
 コンテナはホストのカーネルモジュールを共有する構成で起動する必要があり、`--privileged` / `--network=host` / `-v /lib/modules:/lib/modules` を付与するのが必須です。
 
@@ -16,7 +16,7 @@
 
 ## 1. 前提（ホスト側）
 
-- ホスト OS: **Ubuntu 24.04**
+- ホスト OS: **Ubuntu 22.04**
 - Docker がインストール済み
 - ホストで `openvswitch` カーネルモジュールが使えること
   - `sudo modprobe openvswitch` でロード可能か確認
