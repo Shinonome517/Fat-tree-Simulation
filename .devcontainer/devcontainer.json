@@ -7,8 +7,7 @@
   },
 
   // エントリポイントは Dockerfile のものをそのまま使う
-  "overrideCommand": true,
-  "command": "bash -lc 'sleep infinity'",
+  "overrideCommand": false,
 
 
   // Mininet/OVS を正しく動かすための実行時オプション
