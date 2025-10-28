@@ -3,7 +3,7 @@
 Mininet script: k=4 Fat-Tree with the following IP plan (from the design brief)
 
 - Core–Agg links:  L3 /31 under 10.4.c.x
-  subnet(base) = 10.4.c.(2*L)/31, where L = 2*p + a, p∈{0..3}, a∈{0,1}
+  subnet(base) = 10.4.c.(2*p)/31, p∈{0..3}
   Agg = even (lower), Core = odd (upper)
 
 - Agg–Edge links:  L3 /31 under 10.p.a.x
@@ -52,11 +52,10 @@ class LinuxRouter(Node):
 
 def ip_core_agg(p: int, a: int, c: int):
     """Return (agg_ip/31, core_ip/31) tuple for Core–Agg link.
-    L = 2*p + a; subnet base = 10.4.c.(2*L)
-    Agg is even address, Core is odd address.
+    Subnet base = 10.4.c.(2*p). Agg is even address, Core is odd address.
+    Note: 'a' is ignored (kept for call-site compatibility).
     """
-    L = 2 * p + a
-    base = 2 * L
+    base = 2 * p
     core = f'10.4.{c}.{base+1}/31'
     agg = f'10.4.{c}.{base}/31'
     return agg, core
