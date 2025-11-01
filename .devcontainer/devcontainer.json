@@ -12,6 +12,7 @@
 
   // Mininet/OVS を正しく動かすための実行時オプション
   "runArgs": [
+    "--entrypoint=/usr/local/bin/entrypoint.sh",
     "--privileged",
     "--network=host",
     "-v", "/lib/modules:/lib/modules:ro",
