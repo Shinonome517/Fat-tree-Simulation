@@ -22,10 +22,10 @@
   "remoteUser": "root",
 
   // コンテナ初回作成後に一度だけ実行（バージョン確認など）
-  "postCreateCommand": "bash .devcontainer/scripts/post_create.sh",
+  "postCreateCommand": "bash .devcontainer/scripts/post-create.sh",
 
   // コンテナ起動のたびに実行（健全性チェック）
-  "postStartCommand": "bash .devcontainer/scripts/mininet_sanity.sh || true",
+  "postStartCommand": "bash .devcontainer/scripts/mininet-sanity.sh || true",
 
   // 推奨拡張（任意）
   "customizations": {
