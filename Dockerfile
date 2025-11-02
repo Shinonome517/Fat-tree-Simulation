@@ -37,10 +37,9 @@ RUN git clone --depth=1 https://github.com/private-octopus/picoquic.git "$PICOQU
 RUN ln -sf "$PICOQUIC_HOME/build/picoquicdemo" /usr/local/bin/picoquicdemo \
  && ln -sf "$PICOQUIC_HOME/build/picoquic_ct"  /usr/local/bin/picoquic_ct
 
-# エントリポイント：sysctl適用 & OVSデーモン起動（systemdなし運用）
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# セットアップスクリプト（コンテナ起動後に devcontainer が実行）
+COPY setup.sh /usr/local/bin/setup.sh
+RUN chmod +x /usr/local/bin/setup.sh
 
 WORKDIR /root
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/bin/zsh"]

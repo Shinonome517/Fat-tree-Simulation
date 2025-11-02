@@ -6,13 +6,12 @@
     "context": ".."
   },
 
-  // エントリポイントは Dockerfile のものをそのまま使う
-  "overrideCommand": false,
+  // overrideCommand により devcontainer CLI が sleep infinity を指定
+  "overrideCommand": true,
 
 
   // Mininet/OVS を正しく動かすための実行時オプション
   "runArgs": [
-    "--entrypoint=/usr/local/bin/entrypoint.sh",
     "--privileged",
     "--network=host",
     "-v", "/lib/modules:/lib/modules:ro",
@@ -25,8 +24,8 @@
   // コンテナ初回作成後に一度だけ実行（バージョン確認など）
   "postCreateCommand": "bash .devcontainer/scripts/post-create.sh",
 
-  // コンテナ起動のたびに実行（健全性チェック）
-  "postStartCommand": "bash .devcontainer/scripts/mininet-sanity.sh || true",
+  // コンテナ起動のたびに実行（OVS セットアップ → 健全性チェック）
+  "postStartCommand": "bash ./setup.sh && (bash .devcontainer/scripts/mininet-sanity.sh || true)",
 
   // 推奨拡張（任意）
   "customizations": {
