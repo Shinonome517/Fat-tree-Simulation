@@ -27,10 +27,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN printf 'net.ipv4.ip_forward=1\nnet.core.rmem_max=268435456\nnet.core.wmem_max=268435456\n' \
     > /etc/sysctl.d/99-mininet.conf
 
-# picoquic を取得してビルド（Picotls を自動取得）
-RUN git clone --depth=1 https://github.com/private-octopus/picoquic.git "$PICOQUIC_HOME" \
+# ---- picoquic を最新固定（2025-11-03 時点の master HEAD）+ サブモジュール shallow 取得 ----
+ARG PICOQUIC_COMMIT=73231489b616e61bef3733cc6b5953c2b91d5348
+ARG PICOQUIC_HOME=/opt/picoquic
+
+# 特定コミットを shallow で取得し、サブモジュールも shallow 更新
+RUN git init "$PICOQUIC_HOME" \
+ && git -C "$PICOQUIC_HOME" remote add origin https://github.com/private-octopus/picoquic.git \
+ && git -C "$PICOQUIC_HOME" fetch --depth=1 origin $PICOQUIC_COMMIT \
+ && git -C "$PICOQUIC_HOME" checkout --detach FETCH_HEAD \
+ && git -C "$PICOQUIC_HOME" submodule update --init --recursive --depth=1 --jobs 4 \
+ # CMake 構成（失敗時にログをダンプ）
  && cmake -S "$PICOQUIC_HOME" -B "$PICOQUIC_HOME/build" \
       -DPICOQUIC_FETCH_PTLS=Y -DCMAKE_BUILD_TYPE=Release -G Ninja \
+  || (echo '---- CMakeError.log ----' \
+      && cat "$PICOQUIC_HOME/build/CMakeFiles/CMakeError.log" || true \
+      && echo '---- CMakeOutput.log ----' \
+      && cat "$PICOQUIC_HOME/build/CMakeFiles/CMakeOutput.log" || true \
+      && false) \
  && cmake --build "$PICOQUIC_HOME/build" -j"$(nproc)"
 
 # よく使うバイナリにアクセスしやすいように symlink（install ターゲット非依存）
