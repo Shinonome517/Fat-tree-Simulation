@@ -13,8 +13,9 @@ RUN printf '#!/bin/sh\nexit 0\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/p
 RUN apt-get update && apt-get install -y --no-install-recommends \
     mininet \
     openvswitch-switch openvswitch-common \
-    iproute2 iputils-ping ethtool net-tools tcpdump iperf3 \
-    python3 python3-pip \
+    iproute2 iputils-ping iputils-tracepath ethtool net-tools tcpdump iperf3 \
+    traceroute mtr-tiny \
+    python3 python3-pip python3-pytest \
     git ca-certificates curl \
     build-essential cmake pkg-config ninja-build \
     libssl-dev \
