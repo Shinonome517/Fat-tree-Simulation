@@ -136,21 +136,51 @@ def create_nodes_and_links(net):
         for e in range(2):
             for h in range(2):
                 net.addLink(access[p][e], hosts[p][e][h])
-            net.addLink(edges[p][e], access[p][e])
+            net.addLink(
+                edges[p][e],
+                access[p][e],
+                intfName1=f'e{p}{e}-down0',
+                intfName2=f'b{p}{e}-up0'
+            )
 
     # Agg–Edge links (within pod)
     for p in range(4):
         for a in range(2):
             for e in range(2):
-                net.addLink(aggs[p][a], edges[p][e])
+                net.addLink(
+                    aggs[p][a],
+                    edges[p][e],
+                    intfName1=f'a{p}{a}-to-e{p}{e}',
+                    intfName2=f'e{p}{e}-to-a{p}{a}'
+                )
 
     # Core–Agg links (cross-pod)
     # Modifications to the logic may be needed for larger k values
     for p in range(4):
-        net.addLink(cores[0], aggs[p][0])
-        net.addLink(cores[1], aggs[p][0])
-        net.addLink(cores[2], aggs[p][1])
-        net.addLink(cores[3], aggs[p][1])
+        net.addLink(
+            cores[0],
+            aggs[p][0],
+            intfName1=f'c0-to-a{p}0',
+            intfName2=f'a{p}0-to-c0'
+        )
+        net.addLink(
+            cores[1],
+            aggs[p][0],
+            intfName1=f'c1-to-a{p}0',
+            intfName2=f'a{p}0-to-c1'
+        )
+        net.addLink(
+            cores[2],
+            aggs[p][1],
+            intfName1=f'c2-to-a{p}1',
+            intfName2=f'a{p}1-to-c2'
+        )
+        net.addLink(
+            cores[3],
+            aggs[p][1],
+            intfName1=f'c3-to-a{p}1',
+            intfName2=f'a{p}1-to-c3'
+        )
 
     return cores, aggs, edges, hosts, access
 
@@ -171,7 +201,7 @@ def assign_addresses(cores, aggs, edges, hosts, access):
         for e in range(2):
             e_node = edges[p][e]
             bridge_name = access[p][e].name
-            e_if = link_intfs(e_node)[bridge_name][0]
+            e_if = e_node.intf(f'e{p}{e}-down0')
             e_node.setIP(intf=e_if, ip=svi_ip(p, e))
             for h in range(2):
                 h_node = hosts[p][e][h]
@@ -184,8 +214,8 @@ def assign_addresses(cores, aggs, edges, hosts, access):
             for e in range(2):
                 a_node = aggs[p][a]
                 e_node = edges[p][e]
-                a_if = link_intfs(a_node)[e_node.name][0]
-                e_if = link_intfs(e_node)[a_node.name][0]
+                a_if = a_node.intf(f'a{p}{a}-to-e{p}{e}')
+                e_if = e_node.intf(f'e{p}{e}-to-a{p}{a}')
                 edge_ip, agg_ip = ip_agg_edge(p, a, e)
                 e_node.setIP(intf=e_if, ip=edge_ip)
                 a_node.setIP(intf=a_if, ip=agg_ip)
@@ -195,16 +225,16 @@ def assign_addresses(cores, aggs, edges, hosts, access):
         for c in (0, 1):
             c_node = cores[c]
             a_node = aggs[p][0]
-            c_if = link_intfs(c_node)[a_node.name][0]
-            a_if = link_intfs(a_node)[c_node.name][0]
+            c_if = c_node.intf(f'c{c}-to-a{p}0')
+            a_if = a_node.intf(f'a{p}0-to-c{c}')
             agg_ip, core_ip = ip_core_agg(p, 0, c)
             a_node.setIP(intf=a_if, ip=agg_ip)
             c_node.setIP(intf=c_if, ip=core_ip)
         for c in (2, 3):
             c_node = cores[c]
             a_node = aggs[p][1]
-            c_if = link_intfs(c_node)[a_node.name][0]
-            a_if = link_intfs(a_node)[c_node.name][0]
+            c_if = c_node.intf(f'c{c}-to-a{p}1')
+            a_if = a_node.intf(f'a{p}1-to-c{c}')
             agg_ip, core_ip = ip_core_agg(p, 1, c)
             a_node.setIP(intf=a_if, ip=agg_ip)
             c_node.setIP(intf=c_if, ip=core_ip)
@@ -218,8 +248,8 @@ def install_routes_ecmp(cores, aggs, edges):
             e_node = edges[p][e]
             _, agg_ip_a0 = ip_agg_edge(p, 0, e)
             _, agg_ip_a1 = ip_agg_edge(p, 1, e)
-            dev_a0 = link_intfs(e_node)[f'a{p}0'][0].name
-            dev_a1 = link_intfs(e_node)[f'a{p}1'][0].name
+            dev_a0 = e_node.intf(f'e{p}{e}-to-a{p}0').name
+            dev_a1 = e_node.intf(f'e{p}{e}-to-a{p}1').name
             e_node.cmd(
                 'ip route replace default scope global '
                 f'nexthop via {agg_ip_a0.split("/")[0]} dev {dev_a0} weight 1 '
@@ -232,8 +262,8 @@ def install_routes_ecmp(cores, aggs, edges):
             a_node = aggs[p][a]
             e0_ip, _ = ip_agg_edge(p, a, 0)
             e1_ip, _ = ip_agg_edge(p, a, 1)
-            dev_e0 = link_intfs(a_node)[f'e{p}0'][0].name
-            dev_e1 = link_intfs(a_node)[f'e{p}1'][0].name
+            dev_e0 = a_node.intf(f'a{p}{a}-to-e{p}0').name
+            dev_e1 = a_node.intf(f'a{p}{a}-to-e{p}1').name
             for e_sub in (0, 1):
                 subnet = net_24(p, e_sub)
                 a_node.cmd(
@@ -246,7 +276,7 @@ def install_routes_ecmp(cores, aggs, edges):
             nexthops = []
             for c in core_indices:
                 agg_ip, core_ip = ip_core_agg(p, a, c)
-                dev_c = link_intfs(a_node)[f'c{c}'][0].name
+                dev_c = a_node.intf(f'a{p}{a}-to-c{c}').name
                 nexthops.append(f"nexthop via {core_ip.split('/') [0]} dev {dev_c} weight 1")
             a_node.cmd('ip route replace default ' + ' '.join(nexthops))
 
@@ -256,7 +286,7 @@ def install_routes_ecmp(cores, aggs, edges):
         a_grp = 0 if c in (0, 1) else 1
         for p in range(4):
             agg_ip, _ = ip_core_agg(p, a_grp, c)
-            dev = link_intfs(c_node)[f'a{p}{a_grp}'][0].name
+            dev = c_node.intf(f'c{c}-to-a{p}{a_grp}').name
             for e in range(2):
                 subnet = net_24(p, e)
                 c_node.cmd(f"ip route replace {subnet} via {agg_ip.split('/') [0]} dev {dev}")
