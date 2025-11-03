@@ -260,12 +260,15 @@ def install_routes_ecmp(cores, aggs, edges):
             e1_ip, _ = ip_agg_edge(p, a, 1)
             dev_e0 = a_node.intf(f'a{p}{a}-to-e{p}0').name
             dev_e1 = a_node.intf(f'a{p}{a}-to-e{p}1').name
+            edge_routes = [
+                (e0_ip.split('/')[0], dev_e0),
+                (e1_ip.split('/')[0], dev_e1),
+            ]
             for e_sub in (0, 1):
                 subnet = net_24(p, e_sub)
+                nh_ip, dev = edge_routes[e_sub]
                 a_node.cmd(
-                    f"ip route replace {subnet} scope global "
-                    f"nexthop via {e0_ip.split('/') [0]} dev {dev_e0} weight 1 "
-                    f"nexthop via {e1_ip.split('/') [0]} dev {dev_e1} weight 1"
+                    f"ip route replace {subnet} scope global via {nh_ip} dev {dev}"
                 )
 
             core_indices = (0, 1) if a == 0 else (2, 3)
