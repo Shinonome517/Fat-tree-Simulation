@@ -25,7 +25,7 @@ Tested with Mininet 2.3+ / standard OVS.
 """
 
 from mininet.net import Mininet
-from mininet.node import Node, Host, OVSSwitch
+from mininet.node import Node
 from mininet.link import TCLink
 from mininet.cli import CLI
 from mininet.log import setLogLevel
@@ -97,21 +97,6 @@ def flatten(nested):
     return result
 
 
-def link_intfs(node):
-    """Return mapping peerName -> (intfOnNode, intfOnPeer)."""
-    mapping = {}
-    for intf in node.intfList():
-        if not intf.link or not intf.link.intf1 or not intf.link.intf2:
-            continue
-        i1, i2 = intf.link.intf1, intf.link.intf2
-        if i1.node is node:
-            peer = i2.node
-            mapping[peer.name] = (i1, i2)
-        elif i2.node is node:
-            peer = i1.node
-            mapping[peer.name] = (i2, i1)
-    return mapping
-
 # ---------------------------
 # Build topology (k=4)
 # ---------------------------
@@ -121,27 +106,21 @@ def create_nodes_and_links(net):
     cores = [net.addHost(f'c{c}', cls=LinuxRouter) for c in range(4)]
     aggs = [[net.addHost(f'a{p}{a}', cls=LinuxRouter) for a in range(2)] for p in range(4)]
     edges = [[net.addHost(f'e{p}{e}', cls=LinuxRouter) for e in range(2)] for p in range(4)]
-    access = [[net.addSwitch(f'b{p}{e}', cls=OVSSwitch) for e in range(2)] for p in range(4)]
     hosts = [[[
-        net.addHost(
-            f'h{p}{e}{h}',
-            ip=host_ip(p, e, h),
-            defaultRoute=f'via 10.{p}.{e}.254'
-        )
+        net.addHost(f'h{p}{e}{h}')
         for h in range(2)
     ] for e in range(2)] for p in range(4)]
 
-    # Edge–Server links
+    # Edge–Host links
     for p in range(4):
         for e in range(2):
             for h in range(2):
-                net.addLink(access[p][e], hosts[p][e][h])
-            net.addLink(
-                edges[p][e],
-                access[p][e],
-                intfName1=f'e{p}{e}-down0',
-                intfName2=f'b{p}{e}-up0'
-            )
+                net.addLink(
+                    edges[p][e],
+                    hosts[p][e][h],
+                    intfName1=f'e{p}{e}-h{h}',
+                    intfName2=f'h{p}{e}{h}-eth0'
+                )
 
     # Agg–Edge links (within pod)
     for p in range(4):
@@ -182,7 +161,7 @@ def create_nodes_and_links(net):
             intfName2=f'a{p}1-to-c3'
         )
 
-    return cores, aggs, edges, hosts, access
+    return cores, aggs, edges, hosts
 
 
 def tune_sysctls(routers):
@@ -194,19 +173,36 @@ def tune_sysctls(routers):
         router.cmd('sysctl -w net.ipv4.fib_multipath_hash_policy=1')
 
 
-def assign_addresses(cores, aggs, edges, hosts, access):
-    """Assign IP addresses to all interconnect links and host segments."""
-    # Edge-facing SVIs and host IPs
+def setup_edge_tor(edges):
+    """Turn Edge nodes into ToR switches with a bridge SVI and downlink ports."""
+    for p, pod_edges in enumerate(edges):
+        for e, edge_node in enumerate(pod_edges):
+            bridge = f'br_e{p}{e}'
+            edge_node.cmd(f'ip link add {bridge} type bridge')
+            edge_node.cmd(f'ip link set {bridge} up')
+            for h in range(2):
+                down_if = f'e{p}{e}-h{h}'
+                edge_node.cmd(f'ip link set {down_if} up')
+                edge_node.cmd(f'ip link set {down_if} master {bridge}')
+            edge_node.cmd('sysctl -w net.ipv4.ip_forward=1')
+            edge_node.cmd('sysctl -w net.bridge.bridge-nf-call-iptables=0')
+            edge_node.cmd('sysctl -w net.bridge.bridge-nf-call-ip6tables=0')
+
+
+def assign_addresses(cores, aggs, edges, hosts):
+    """Assign IP addresses to interconnect links and host interfaces."""
+    # Host /24 addresses and default routes
     for p in range(4):
         for e in range(2):
-            e_node = edges[p][e]
-            bridge_name = access[p][e].name
-            e_if = e_node.intf(f'e{p}{e}-down0')
-            e_node.setIP(intf=e_if, ip=svi_ip(p, e))
+            bridge = f'br_e{p}{e}'
+            edge_node = edges[p][e]
+            edge_node.cmd(f'ip addr replace {svi_ip(p, e)} dev {bridge}')
+            gateway = svi_ip(p, e).split('/')[0]
             for h in range(2):
+                iface = f'h{p}{e}{h}-eth0'
                 h_node = hosts[p][e][h]
-                h_if = link_intfs(h_node)[bridge_name][0]
-                h_node.setIP(intf=h_if, ip=host_ip(p, e, h))
+                h_node.setIP(intf=iface, ip=host_ip(p, e, h))
+                h_node.setDefaultRoute(f'via {gateway}')
 
     # Agg–Edge /31 links
     for p in range(4):
@@ -292,6 +288,31 @@ def install_routes_ecmp(cores, aggs, edges):
                 c_node.cmd(f"ip route replace {subnet} via {agg_ip.split('/') [0]} dev {dev}")
 
 
+def run_sanity_checks(edges, hosts):
+    """Execute quick automated checks for bridge IP, L2, and L3 connectivity."""
+    edge = edges[0][0]
+    print('=== br_e00 address ===')
+    print(edge.cmd('ip addr show br_e00'))
+    print('=== Edge downlinks (expect no inet addr) ===')
+    for h in range(2):
+        print(edge.cmd(f'ip addr show dev e00-h{h}'))
+    print('=== br_e00 member ports ===')
+    print(edge.cmd('bridge link show br_e00'))
+
+    h_local = hosts[0][0][0]
+    h_peer_same = hosts[0][0][1]
+    print('=== Same-ToR L2 ping (h000 -> h001) ===')
+    print(h_local.cmd('ping -c1 -W1 10.0.0.2'))
+    print('=== h000 ARP table after ping ===')
+    print(h_local.cmd('ip neigh show dev h000-eth0'))
+
+    h_remote = hosts[1][0][0]
+    print('=== Cross-pod L3 ping (h000 -> h100) ===')
+    print(h_local.cmd('ping -c1 -W1 10.1.0.1'))
+    print('=== h000 route table snippet ===')
+    print(h_local.cmd('ip route show default'))
+
+
 def run_cli(net):
     """Drop into Mininet CLI with a few handy hints."""
     print('\nTopology is up. Quick sanity checks you can try:')
@@ -304,13 +325,15 @@ def run_cli(net):
 
 def build():
     net = Mininet(link=TCLink, build=False)
-    cores, aggs, edges, hosts, access = create_nodes_and_links(net)
+    cores, aggs, edges, hosts = create_nodes_and_links(net)
     net.build()
 
     routers = cores + flatten(aggs) + flatten(edges)
     tune_sysctls(routers)
-    assign_addresses(cores, aggs, edges, hosts, access)
+    setup_edge_tor(edges)
+    assign_addresses(cores, aggs, edges, hosts)
     install_routes_ecmp(cores, aggs, edges)
+    run_sanity_checks(edges, hosts)
     run_cli(net)
 
 
