@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-Mininet script: k=4 Fat-Tree with the following IP plan (from the design brief)
+Mininet script: k=4 Fat-Tree with an underlay/host address plan suitable
+for DC-style Clos fabrics and ECMP testing. Addressing is as follows:
 
-- Core–Agg links:  L3 /31 under 10.4.c.x
-  subnet(base) = 10.4.c.(2*p)/31, p∈{0..3}
-  Agg = even (lower), Core = odd (upper)
+- Server segments per Edge (Host space): L2 /24 under 10.p.e.0/24
+  Servers: 10.p.e.{1,2}; Gateway (Edge SVI): 10.p.e.254/24
 
-- Agg–Edge links:  L3 /31 under 10.p.a.x
-  subnet(base) = 10.p.a.(2*e)/31, e∈{0,1}
+- Agg–Edge links (Underlay, fully separated): L3 /31 under 172.(16+p).a.x
+  subnet(base) = 172.(16+p).a.(2*e)/31, e∈{0,1}
   Edge = even (lower), Agg = odd (upper)
 
-- Server segments per Edge: L2 /24 under 10.p.e.0/24
-  Servers: 10.p.e.{1,2};  Gateway (Edge SVI): 10.p.e.254/24
+- Core–Agg links (Underlay, fully separated): L3 /31 under 172.(32+p).c.x
+  subnet(base) = 172.(32+p).c.(2*a)/31, a∈{0,1}
+  Agg  = even (lower), Core = odd (upper)
 
-- ECMP policy:
+- ECMP policy (static routes for simplicity):
   * Hosts default → Edge SVI
   * Edge default → both Aggs in the same Pod (2-way ECMP using multiple nexthops)
   * Agg routes to pod-local server /24 via both Edges (directly connected) AND
     default → its two Core uplinks in the same Core-group (2-way ECMP)
-  * Core has specific /24 routes for all 8 racks via the corresponding Agg (no ECMP needed at Core)
+  * Core has specific /24 routes for all racks via the corresponding Agg (no ECMP needed at Core)
+
+Underlay (Agg–Edge/Core–Agg) is completely disjoint from Host space for clarity
+and to avoid any address collisions. This layout generalizes to larger k when
+pod index p is embedded in the second octet of the underlay blocks.
 
 This script uses LinuxRouter nodes for Core/Agg/Edge to keep routing explicit.
 Tested with Mininet 2.3+ / standard OVS.
@@ -52,23 +57,35 @@ class LinuxRouter(Node):
 
 def ip_core_agg(p: int, a: int, c: int):
     """Return (agg_ip/31, core_ip/31) tuple for Core–Agg link.
-    Subnet base = 10.4.c.(2*p). Agg is even address, Core is odd address.
-    Note: 'a' is ignored (kept for call-site compatibility).
+    Underlay block: 172.(32+p).c.(2*a)/31
+    Agg is even address, Core is odd address.
+
+    Parameters
+    - p: pod index (0..3 for k=4), embedded in 2nd octet (32+p)
+    - a: agg index within pod (0 or 1), mapped to base host part (2*a)
+    - c: core index (0..3), mapped to 3rd octet
     """
-    base = 2 * p
-    core = f'10.4.{c}.{base+1}/31'
-    agg = f'10.4.{c}.{base}/31'
+    second = 32 + p
+    base = 2 * a
+    core = f'172.{second}.{c}.{base+1}/31'
+    agg = f'172.{second}.{c}.{base}/31'
     return agg, core
 
 
 def ip_agg_edge(p: int, a: int, e: int):
     """Return (edge_ip/31, agg_ip/31) tuple for Agg–Edge link.
-    subnet base = 10.p.a.(2*e)
+    Underlay block: 172.(16+p).a.(2*e)/31
     Edge is even address, Agg is odd address.
+
+    Parameters
+    - p: pod index (0..3 for k=4), embedded in 2nd octet (16+p)
+    - a: agg index within pod (0 or 1), mapped to 3rd octet
+    - e: edge index within pod (0 or 1), mapped to base host part (2*e)
     """
+    second = 16 + p
     base = 2 * e
-    agg = f'10.{p}.{a}.{base+1}/31'
-    edge = f'10.{p}.{a}.{base}/31'
+    agg = f'172.{second}.{a}.{base+1}/31'
+    edge = f'172.{second}.{a}.{base}/31'
     return edge, agg
 
 
