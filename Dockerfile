@@ -14,12 +14,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mininet \
     openvswitch-switch openvswitch-common \
     iproute2 iputils-ping iputils-tracepath ethtool net-tools tcpdump iperf3 \
+    conntrack \
     traceroute mtr-tiny \
     python3 python3-pip python3-pytest \
     git ca-certificates curl \
     build-essential cmake pkg-config ninja-build \
     libssl-dev \
     zsh \
+    nftables \
     # あると便利な診断
     procps less vim \
  && rm -rf /var/lib/apt/lists/*
@@ -32,6 +34,13 @@ RUN printf 'net.ipv4.ip_forward=1\nnet.core.rmem_max=268435456\nnet.core.wmem_ma
 ARG PICOQUIC_COMMIT=73231489b616e61bef3733cc6b5953c2b91d5348
 ARG PICOQUIC_HOME=/opt/picoquic
 
+# 拡張フラグ付きデモ（-F, -G など）を有効化するためのビルド引数。
+# 既定では「デモの拡張を全開にする」ことを意図した C 定義群を付与します。
+# もし将来のコミットで不要/名称変更になっても副作用はありません（未使用マクロの定義は無害）。
+ARG PICOQUIC_DEMO_CDEFS="-DPICOQUIC_DEMO_FULL -DPICOQUIC_DEMO_EXPERIMENTAL -DPICOQUIC_VNEG_GREASE -DPICOQUIC_ENABLE_GREASE"
+# qlog など可視化も有効化（未使用なら無害）
+ARG PICOQUIC_ENABLE_QLOG=ON
+
 # 特定コミットを shallow で取得し、サブモジュールも shallow 更新
 RUN git init "$PICOQUIC_HOME" \
  && git -C "$PICOQUIC_HOME" remote add origin https://github.com/private-octopus/picoquic.git \
@@ -40,7 +49,10 @@ RUN git init "$PICOQUIC_HOME" \
  && git -C "$PICOQUIC_HOME" submodule update --init --recursive --depth=1 --jobs 4 \
  # CMake 構成（失敗時にログをダンプ）
  && cmake -S "$PICOQUIC_HOME" -B "$PICOQUIC_HOME/build" \
-      -DPICOQUIC_FETCH_PTLS=Y -DCMAKE_BUILD_TYPE=Release -G Ninja \
+      -DPICOQUIC_FETCH_PTLS=Y \
+      -DPICOQUIC_ENABLE_QLOG=${PICOQUIC_ENABLE_QLOG} \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo -G Ninja \
+      -DCMAKE_C_FLAGS="${PICOQUIC_DEMO_CDEFS}" \
   || (echo '---- CMakeError.log ----' \
       && cat "$PICOQUIC_HOME/build/CMakeFiles/CMakeError.log" || true \
       && echo '---- CMakeOutput.log ----' \

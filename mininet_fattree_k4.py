@@ -26,7 +26,18 @@ and to avoid any address collisions. This layout generalizes to larger k when
 pod index p is embedded in the second octet of the underlay blocks.
 
 This script uses LinuxRouter nodes for Core/Agg/Edge to keep routing explicit.
-Tested with Mininet 2.3+ / standard OVS.
+All Core/Agg/Edge LinuxRouter nodes have `net.ipv4.conf.*.rp_filter=0` and
+`net.ipv4.fib_multipath_hash_policy=1` applied via `tune_sysctls()` to make
+ECMP hashing work consistently.
+
+Edge nodes operate as ToR switches built from a Linux bridge `br_e{p}{e}`.
+Two host-facing links `e{p}{e}-h{h}` (h∈{0,1}) are enslaved to that bridge,
+which carries the SVI `10.p.e.254/24`. L3 northbound from the Edge uses
+underlay /31 links on dedicated interfaces named `e{p}{e}-to-a{p}{a}` /
+`a{p}{a}-to-e{p}{e}` (Edge lower IP, Agg higher IP).
+
+The script is OVS-free; tested with Mininet 2.3+ using Linux kernel networking
+primitives only.
 """
 
 from mininet.net import Mininet
