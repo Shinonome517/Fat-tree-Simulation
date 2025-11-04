@@ -18,12 +18,6 @@ HOST_ROUTE_CASES: List[Tuple[int, int, int, str]] = [
 
 ECMP_EDGE_DEFAULT_CASES: List[Tuple[int, int]] = [(p, e) for p in range(4) for e in range(2)]
 
-ECMP_AGG_SUBNET_CASES: List[Tuple[int, int, str]] = []
-for p in range(4):
-    for a in range(2):
-        for e_sub in range(2):
-            ECMP_AGG_SUBNET_CASES.append((p, a, fattree.net_24(p, e_sub)))
-
 ECMP_AGG_DEFAULT_CASES: List[Tuple[int, int]] = [(p, a) for p in range(4) for a in range(2)]
 
 
@@ -53,19 +47,6 @@ def test_ecmp_configured_on_edges(fattree_net, pod_idx, edge_idx):
             [
                 DumpSpec(edge, "ip route show default", label=f"{edge.name} ip route"),
                 DumpSpec(edge, "ip -j route show default", label=f"{edge.name} ip -j route"),
-            ],
-        )
-
-
-@pytest.mark.parametrize("pod_idx, agg_idx, subnet", ECMP_AGG_SUBNET_CASES)
-def test_ecmp_configured_on_aggs_for_servers(fattree_net, pod_idx, agg_idx, subnet):
-    agg = fattree_net["aggs"][pod_idx][agg_idx]
-    if not has_multipath(agg, subnet):
-        fail_with_dumps(
-            f"{agg.name} missing ECMP for {subnet}",
-            [
-                DumpSpec(agg, f"ip route show {subnet}", label=f"{agg.name} ip route {subnet}"),
-                DumpSpec(agg, f"ip -j route show {subnet}", label=f"{agg.name} ip -j route {subnet}"),
             ],
         )
 

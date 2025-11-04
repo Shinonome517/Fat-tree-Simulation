@@ -15,6 +15,10 @@ def _ip_route_json(node: Any, target: str) -> List[Dict[str, Any]]:
 
 
 def has_multipath(node: Any, dst: str) -> bool:
-    """Return True when the selected route contains >=2 nexthops."""
+    """Return True when the selected route contains >=2 next-hops."""
     routes = _ip_route_json(node, dst)
-    return any("multipath" in r and len(r["multipath"]) >= 2 for r in routes)
+    for r in routes:
+        nexthops = r.get("nexthops")
+        if isinstance(nexthops, list) and len(nexthops) >= 2:
+            return True
+    return False

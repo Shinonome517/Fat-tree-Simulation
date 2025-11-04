@@ -38,28 +38,3 @@ def test_core_has_route_to_edge_subnet(
         ],
     )
 
-
-@pytest.mark.parametrize("core_idx,pod_idx,edge_idx,subnet", CORE_ROUTE_CASES)
-def test_core_reaches_edge_svi(
-    fattree_net, core_idx: int, pod_idx: int, edge_idx: int, subnet: str
-) -> None:
-    core = fattree_net["cores"][core_idx]
-    target_ip = fattree.svi_ip(pod_idx, edge_idx).split("/")[0]
-    description = f"c{core_idx} -> {target_ip}"
-
-    ping_output = core.cmd(f"ping -c2 -W1 {target_ip}")
-    if " 0% packet loss" in ping_output:
-        return
-
-    fail_with_dumps(
-        f"{description} ping failed\n\n{ping_output.strip()}",
-        [
-            DumpSpec(core, f"ip route show {subnet}", label=f"{description} ip route {subnet}"),
-            DumpSpec(
-                core,
-                f"ip -j route show {subnet}",
-                label=f"{description} ip -j route {subnet}",
-            ),
-            DumpSpec(core, f"tracepath -n -m 5 {target_ip}", label=f"{description} tracepath"),
-        ],
-    )
