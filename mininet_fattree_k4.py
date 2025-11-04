@@ -206,6 +206,17 @@ def setup_edge_tor(edges):
             edge_node.cmd('sysctl -w net.bridge.bridge-nf-call-ip6tables=0')
 
 
+def disable_offloads(nodes):
+    """Disable GRO/GSO/TSO/LRO on all non-loopback interfaces for the given nodes."""
+    for node in nodes:
+        for intf in node.intfList():
+            if not intf or not intf.name or intf.name == 'lo':
+                continue
+            node.cmd(
+                f'ethtool -K {intf.name} gro off gso off tso off lro off || true'
+            )
+
+
 def assign_addresses(cores, aggs, edges, hosts):
     """Assign IP addresses to interconnect links and host interfaces."""
     # Host /24 addresses and default routes
@@ -326,6 +337,7 @@ def build():
     routers = cores + flatten(aggs) + flatten(edges)
     tune_sysctls(routers)
     setup_edge_tor(edges)
+    disable_offloads(routers + flatten(hosts))
     assign_addresses(cores, aggs, edges, hosts)
     install_routes_ecmp(cores, aggs, edges)
     run_cli(net)
