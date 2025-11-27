@@ -1,6 +1,6 @@
-# Fat-Tree　Simulation Docker イメージ（Mininet + OVS(kernel datapath) + picoquic）
+# Fat-Tree Simulation Docker イメージ（Mininet + picoquic）
 
-このリポジトリはUbuntu 22.04 ホスト上で、**kernel datapath の Open vSwitch (ovsk)** を利用して Mininet と picoquic を動かすための Docker イメージと Fat-Tree に Multipath quic を適用するエミュレート用のスクリプトを提供します。  
+このリポジトリはUbuntu 22.04 ホスト上で Mininet と picoquic を動かすための Docker イメージと、Fat-Tree (k=4) をエミュレートするためのスクリプトを提供します。  
 
 コンテナはホストのカーネルモジュールを共有する構成で起動する必要があり、`--privileged` / `--network=host` / `-v /lib/modules:/lib/modules` を付与するのが必須です。
 
@@ -10,7 +10,10 @@
 1. 前提（ホスト側）
 2. ビルド手順
 3. コンテナ起動手順（推奨コマンド）
-4. コンテナ内での確認コマンド（OVS / Mininet / picoquic）
+4. コンテナ内の初期化
+5. Fat-Tree の起動方法
+6. コンテナ内での確認コマンド（Mininet / picoquic）
+7. テスト（pytest）
 
 ---
 
@@ -18,8 +21,6 @@
 
 - ホスト OS: **Ubuntu 22.04**
 - Docker がインストール済み
-- ホストで `openvswitch` カーネルモジュールが使えること
-  - `sudo modprobe openvswitch` でロード可能か確認
 - Docker を実行するユーザが `sudo` 権限を持っていること
 
 ---
@@ -43,28 +44,44 @@ docker run --name your-container-name \
   -it mpquic-lab
 ```
 
-- --privileged：にコンテナへカーネル機能へのアクセス権を付与（OVS用）
+- --privileged：コンテナへカーネル機能へのアクセス権を付与
 - --network=host：ホストとネットワークを共有
 - -v /lib/modules:/lib/modules：カーネルモジュールを共有
-- -v -v "$PWD:/workspace"：ホスト側カレントディレクトリを
+- -v "$PWD:/workspace"：ホスト側カレントディレクトリをコンテナの`/workspace`として利用
 
 ---
 
-## 4. コンテナ内での確認コマンド
+## 4. コンテナ内の初期化
 
-### OVS
+コンテナに入った直後に、以下を実行して初期化してください（devcontainer では自動実行されるため不要です）。
 
-OVSの動作確認
-
-```sh
-ovs-vsctl show
-ovs-dpctl show
-ps aux | grep -E 'ovsdb-server|ovs-vswitchd'
+```bash
+sudo /usr/local/bin/setup.sh
 ```
 
-### Mininet
+---
 
-Mininetの動作確認
+## 5. Fat-Tree の起動方法
+
+CLIに入って操作する場合の例:
+
+```bash
+sudo python3 main.py --cli
+```
+
+主なオプションと既定値:
+- `--bw` (デフォルト: 1000 Mbps)
+- `--delay` (デフォルト: 0.2ms)
+- `--q` (デフォルト: 150 パケット)
+- `--cli` を付けない場合はヘッドレスで常駐
+
+停止は `Ctrl+C`。
+
+---
+
+## 6. コンテナ内での確認コマンド
+
+### Mininet
 
 ```sh
 sudo mn --test pingall
@@ -80,3 +97,11 @@ picoquicdemo -h
 ```
 
 ---
+
+## 7. テスト（pytest）
+
+ルーティング・ECMP・アドレス割り当てを検証するpytestスイートがあります（root必須）。`iperf3` を使うテストも含まれるため、同梱のバイナリをそのまま利用できます。
+
+```bash
+sudo pytest -q
+```
