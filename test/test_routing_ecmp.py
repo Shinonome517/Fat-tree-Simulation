@@ -1,3 +1,4 @@
+import os
 import time
 from typing import Dict, List, Tuple
 
@@ -8,17 +9,29 @@ from test.util_debug import DumpSpec, fail_with_dumps
 from test.util_routing import has_multipath
 from test.util_stats import tx_bytes_kernel
 
+K = int(os.environ.get("FATTREE_K", "4"))
+assert K % 2 == 0 and 2 <= K <= 16
+N_PODS = K
+N_AGG_PER_POD = K // 2
+N_EDGE_PER_POD = K // 2
+N_HOSTS_PER_EDGE = K // 2
+N_CORE_GROUPS = K // 2
+N_CORE_PER_GROUP = K // 2
+N_CORES = N_CORE_GROUPS * N_CORE_PER_GROUP
+
+if N_AGG_PER_POD < 2:
+    pytest.skip("ECMP tests require k>=4 (at least two aggs per pod).", allow_module_level=True)
 
 HOST_ROUTE_CASES: List[Tuple[int, int, int, str]] = [
     (p, e, h, f"h{p}{e}{h}-eth0")
-    for p in range(4)
-    for e in range(2)
-    for h in range(2)
+    for p in range(N_PODS)
+    for e in range(N_EDGE_PER_POD)
+    for h in range(N_HOSTS_PER_EDGE)
 ]
 
-ECMP_EDGE_DEFAULT_CASES: List[Tuple[int, int]] = [(p, e) for p in range(4) for e in range(2)]
+ECMP_EDGE_DEFAULT_CASES: List[Tuple[int, int]] = [(p, e) for p in range(N_PODS) for e in range(N_EDGE_PER_POD)]
 
-ECMP_AGG_DEFAULT_CASES: List[Tuple[int, int]] = [(p, a) for p in range(4) for a in range(2)]
+ECMP_AGG_DEFAULT_CASES: List[Tuple[int, int]] = [(p, a) for p in range(N_PODS) for a in range(N_AGG_PER_POD)]
 
 
 @pytest.mark.parametrize("pod_idx, edge_idx, host_idx, iface", HOST_ROUTE_CASES)
@@ -71,7 +84,7 @@ def test_ecmp_spreads_traffic(fattree_net):
     edge = fattree_net["edges"][0][0]
     dst_ip = fattree.host_ip(1, 0, 0).split("/")[0]
 
-    egress_ports = ["e00-to-a00", "e00-to-a01"]
+    egress_ports = [f"e00-to-a0{a}" for a in range(N_AGG_PER_POD)]
     before: Dict[str, int] = {iface: tx_bytes_kernel(edge, iface) for iface in egress_ports}
 
     receiver.cmd("pkill iperf3")

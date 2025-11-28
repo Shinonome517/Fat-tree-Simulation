@@ -1,5 +1,5 @@
 """
-Fat-Tree (k=4) topology construction for Mininet.
+Fat-Tree topology construction for Mininet (even k, default 4).
 
 This module focuses purely on building and tearing down the topology:
 - LinuxRouter node definition
@@ -73,7 +73,7 @@ def svi_ip(p: int, e: int) -> str:
 
 
 def host_ip(p: int, e: int, hidx: int) -> str:
-    # hidx ∈ {0,1} → hosts: .1, .2
+    # Hosts start at .1 and increment per attached host
     host = 1 + hidx
     return f'10.{p}.{e}.{host}/24'
 
@@ -93,6 +93,35 @@ def flatten(nested):
     return result
 
 
+def _fattree_dims(k: int):
+    """
+    Validate k and return the derived fat-tree dimensions.
+
+    Returns tuple:
+    (n_pods, n_agg_per_pod, n_edge_per_pod, n_hosts_per_edge, n_core_groups, n_core_per_group, n_cores)
+    """
+    assert k % 2 == 0, "k must be even"
+    assert 2 <= k <= 16, "k must satisfy 2 <= k <= 16"
+
+    n_pods = k
+    n_agg_per_pod = k // 2
+    n_edge_per_pod = k // 2
+    n_hosts_per_edge = k // 2
+
+    n_core_groups = k // 2
+    n_core_per_group = k // 2
+    n_cores = n_core_groups * n_core_per_group
+    return (
+        n_pods,
+        n_agg_per_pod,
+        n_edge_per_pod,
+        n_hosts_per_edge,
+        n_core_groups,
+        n_core_per_group,
+        n_cores,
+    )
+
+
 @dataclass
 class FatTreeContext:
     """Container for the Fat-Tree Mininet objects and configuration."""
@@ -102,6 +131,7 @@ class FatTreeContext:
     aggs: List[List[Node]]
     edges: List[List[Node]]
     hosts: List[List[List[Node]]]
+    k: int
     link_params: Dict[str, object]
 
     def routers(self) -> List[Node]:
@@ -109,20 +139,47 @@ class FatTreeContext:
         return self.cores + flatten(self.aggs) + flatten(self.edges)
 
 
-def create_nodes_and_links(net: Mininet, link_params: Dict[str, object]):
+def create_nodes_and_links(
+    net: Mininet,
+    link_params: Optional[Dict[str, object]] = None,
+    k: int = 4,
+):
     """Create routers, hosts, and interconnect them."""
-    cores = [net.addHost(f'c{c}', cls=LinuxRouter, ip=None) for c in range(4)]
-    aggs = [[net.addHost(f'a{p}{a}', cls=LinuxRouter, ip=None) for a in range(2)] for p in range(4)]
-    edges = [[net.addHost(f'e{p}{e}', cls=LinuxRouter, ip=None) for e in range(2)] for p in range(4)]
-    hosts = [[[
-        net.addHost(f'h{p}{e}{h}', ip=None)
-        for h in range(2)
-    ] for e in range(2)] for p in range(4)]
+    (
+        n_pods,
+        n_agg_per_pod,
+        n_edge_per_pod,
+        n_hosts_per_edge,
+        n_core_groups,
+        n_core_per_group,
+        n_cores,
+    ) = _fattree_dims(k)
+    link_params = link_params or {}
+
+    cores = [net.addHost(f'c{c}', cls=LinuxRouter, ip=None) for c in range(n_cores)]
+    aggs = [
+        [net.addHost(f'a{p}{a}', cls=LinuxRouter, ip=None) for a in range(n_agg_per_pod)]
+        for p in range(n_pods)
+    ]
+    edges = [
+        [net.addHost(f'e{p}{e}', cls=LinuxRouter, ip=None) for e in range(n_edge_per_pod)]
+        for p in range(n_pods)
+    ]
+    hosts = [
+        [
+            [
+                net.addHost(f'h{p}{e}{h}', ip=None)
+                for h in range(n_hosts_per_edge)
+            ]
+            for e in range(n_edge_per_pod)
+        ]
+        for p in range(n_pods)
+    ]
 
     # Edge–Host links
-    for p in range(4):
-        for e in range(2):
-            for h in range(2):
+    for p in range(n_pods):
+        for e in range(n_edge_per_pod):
+            for h in range(n_hosts_per_edge):
                 net.addLink(
                     edges[p][e],
                     hosts[p][e][h],
@@ -132,9 +189,9 @@ def create_nodes_and_links(net: Mininet, link_params: Dict[str, object]):
                 )
 
     # Agg–Edge links (within pod)
-    for p in range(4):
-        for a in range(2):
-            for e in range(2):
+    for p in range(n_pods):
+        for a in range(n_agg_per_pod):
+            for e in range(n_edge_per_pod):
                 net.addLink(
                     aggs[p][a],
                     edges[p][e],
@@ -144,35 +201,17 @@ def create_nodes_and_links(net: Mininet, link_params: Dict[str, object]):
                 )
 
     # Core–Agg links (cross-pod)
-    for p in range(4):
-        net.addLink(
-            cores[0],
-            aggs[p][0],
-            intfName1=f'c0-to-a{p}0',
-            intfName2=f'a{p}0-to-c0',
-            **link_params,
-        )
-        net.addLink(
-            cores[1],
-            aggs[p][0],
-            intfName1=f'c1-to-a{p}0',
-            intfName2=f'a{p}0-to-c1',
-            **link_params,
-        )
-        net.addLink(
-            cores[2],
-            aggs[p][1],
-            intfName1=f'c2-to-a{p}1',
-            intfName2=f'a{p}1-to-c2',
-            **link_params,
-        )
-        net.addLink(
-            cores[3],
-            aggs[p][1],
-            intfName1=f'c3-to-a{p}1',
-            intfName2=f'a{p}1-to-c3',
-            **link_params,
-        )
+    for p in range(n_pods):
+        for a in range(n_agg_per_pod):
+            for i in range(n_core_groups):
+                c = i * n_core_per_group + a
+                net.addLink(
+                    cores[c],
+                    aggs[p][a],
+                    intfName1=f'c{c}-to-a{p}{a}',
+                    intfName2=f'a{p}{a}-to-c{c}',
+                    **link_params,
+                )
 
     return cores, aggs, edges, hosts
 
@@ -186,14 +225,15 @@ def tune_sysctls(routers: List[Node]) -> None:
         router.cmd('sysctl -w net.ipv4.fib_multipath_hash_policy=1')
 
 
-def setup_edge_tor(edges: List[List[Node]]) -> None:
+def setup_edge_tor(edges: List[List[Node]], k: int = 4) -> None:
     """Turn Edge nodes into ToR switches with a bridge SVI and downlink ports."""
+    (_, _, _, n_hosts_per_edge, _, _, _,) = _fattree_dims(k)
     for p, pod_edges in enumerate(edges):
         for e, edge_node in enumerate(pod_edges):
             bridge = f'br_e{p}{e}'
             edge_node.cmd(f'ip link add {bridge} type bridge')
             edge_node.cmd(f'ip link set {bridge} up')
-            for h in range(2):
+            for h in range(n_hosts_per_edge):
                 down_if = f'e{p}{e}-h{h}'
                 edge_node.cmd(f'ip link set {down_if} up')
                 edge_node.cmd(f'ip link set {down_if} master {bridge}')
@@ -213,25 +253,34 @@ def disable_offloads(nodes: List[Node]) -> None:
             )
 
 
-def assign_addresses(cores, aggs, edges, hosts) -> None:
+def assign_addresses(cores, aggs, edges, hosts, k: int = 4) -> None:
     """Assign IP addresses to interconnect links and host interfaces."""
+    (
+        n_pods,
+        n_agg_per_pod,
+        n_edge_per_pod,
+        n_hosts_per_edge,
+        n_core_groups,
+        n_core_per_group,
+        _,
+    ) = _fattree_dims(k)
     # Host /24 addresses and default routes
-    for p in range(4):
-        for e in range(2):
+    for p in range(n_pods):
+        for e in range(n_edge_per_pod):
             bridge = f'br_e{p}{e}'
             edge_node = edges[p][e]
             edge_node.cmd(f'ip addr replace {svi_ip(p, e)} dev {bridge}')
             gateway = svi_ip(p, e).split('/')[0]
-            for h in range(2):
+            for h in range(n_hosts_per_edge):
                 iface = f'h{p}{e}{h}-eth0'
                 h_node = hosts[p][e][h]
                 h_node.setIP(intf=iface, ip=host_ip(p, e, h))
                 h_node.setDefaultRoute(f'via {gateway}')
 
     # Agg–Edge /31 links
-    for p in range(4):
-        for a in range(2):
-            for e in range(2):
+    for p in range(n_pods):
+        for a in range(n_agg_per_pod):
+            for e in range(n_edge_per_pod):
                 a_node = aggs[p][a]
                 e_node = edges[p][e]
                 a_if = a_node.intf(f'a{p}{a}-to-e{p}{e}')
@@ -241,78 +290,77 @@ def assign_addresses(cores, aggs, edges, hosts) -> None:
                 a_node.setIP(intf=a_if, ip=agg_ip)
 
     # Core–Agg /31 links
-    for p in range(4):
-        for c in (0, 1):
-            c_node = cores[c]
-            a_node = aggs[p][0]
-            c_if = c_node.intf(f'c{c}-to-a{p}0')
-            a_if = a_node.intf(f'a{p}0-to-c{c}')
-            agg_ip, core_ip = ip_core_agg(p, 0, c)
-            a_node.setIP(intf=a_if, ip=agg_ip)
-            c_node.setIP(intf=c_if, ip=core_ip)
-        for c in (2, 3):
-            c_node = cores[c]
-            a_node = aggs[p][1]
-            c_if = c_node.intf(f'c{c}-to-a{p}1')
-            a_if = a_node.intf(f'a{p}1-to-c{c}')
-            agg_ip, core_ip = ip_core_agg(p, 1, c)
-            a_node.setIP(intf=a_if, ip=agg_ip)
-            c_node.setIP(intf=c_if, ip=core_ip)
+    for p in range(n_pods):
+        for a in range(n_agg_per_pod):
+            for i in range(n_core_groups):
+                c = i * n_core_per_group + a
+                c_node = cores[c]
+                a_node = aggs[p][a]
+                c_if = c_node.intf(f'c{c}-to-a{p}{a}')
+                a_if = a_node.intf(f'a{p}{a}-to-c{c}')
+                agg_ip, core_ip = ip_core_agg(p, a, c)
+                a_node.setIP(intf=a_if, ip=agg_ip)
+                c_node.setIP(intf=c_if, ip=core_ip)
 
 
-def install_routes_ecmp(cores, aggs, edges) -> None:
+def install_routes_ecmp(cores, aggs, edges, k: int = 4) -> None:
     """Install static routes implementing the ECMP policy."""
-    # Edge default route via both Aggs
-    for p in range(4):
-        for e in range(2):
+    (
+        n_pods,
+        n_agg_per_pod,
+        n_edge_per_pod,
+        _,
+        n_core_groups,
+        n_core_per_group,
+        n_cores,
+    ) = _fattree_dims(k)
+    # Edge default route via all pod-local Aggs
+    for p in range(n_pods):
+        for e in range(n_edge_per_pod):
             e_node = edges[p][e]
-            _, agg_ip_a0 = ip_agg_edge(p, 0, e)
-            _, agg_ip_a1 = ip_agg_edge(p, 1, e)
-            dev_a0 = e_node.intf(f'e{p}{e}-to-a{p}0').name
-            dev_a1 = e_node.intf(f'e{p}{e}-to-a{p}1').name
-            e_node.cmd(
-                'ip route replace default scope global '
-                f'nexthop via {agg_ip_a0.split("/")[0]} dev {dev_a0} weight 1 '
-                f'nexthop via {agg_ip_a1.split("/")[0]} dev {dev_a1} weight 1'
-            )
+            nexthops = []
+            for a in range(n_agg_per_pod):
+                _, agg_ip = ip_agg_edge(p, a, e)
+                dev = e_node.intf(f'e{p}{e}-to-a{p}{a}').name
+                nexthops.append(
+                    f'nexthop via {agg_ip.split("/")[0]} dev {dev} weight 1'
+                )
+            e_node.cmd('ip route replace default scope global ' + ' '.join(nexthops))
 
     # Agg routes to pod-local subnets and defaults via cores
-    for p in range(4):
-        for a in range(2):
+    for p in range(n_pods):
+        for a in range(n_agg_per_pod):
             a_node = aggs[p][a]
-            e0_ip, _ = ip_agg_edge(p, a, 0)
-            e1_ip, _ = ip_agg_edge(p, a, 1)
-            dev_e0 = a_node.intf(f'a{p}{a}-to-e{p}0').name
-            dev_e1 = a_node.intf(f'a{p}{a}-to-e{p}1').name
-            edge_routes = [
-                (e0_ip.split('/')[0], dev_e0),
-                (e1_ip.split('/')[0], dev_e1),
-            ]
-            for e_sub in (0, 1):
-                subnet = net_24(p, e_sub)
-                nh_ip, dev = edge_routes[e_sub]
+            # Pod-local /24 networks via edges
+            for e in range(n_edge_per_pod):
+                subnet = net_24(p, e)
+                edge_ip, _ = ip_agg_edge(p, a, e)
+                dev = a_node.intf(f'a{p}{a}-to-e{p}{e}').name
                 a_node.cmd(
-                    f"ip route replace {subnet} scope global via {nh_ip} dev {dev}"
+                    f"ip route replace {subnet} scope global via {edge_ip.split('/')[0]} dev {dev}"
                 )
 
-            core_indices = (0, 1) if a == 0 else (2, 3)
+            # Default ECMP via all cores connected to this agg
             nexthops = []
-            for c in core_indices:
+            for i in range(n_core_groups):
+                c = i * n_core_per_group + a
                 agg_ip, core_ip = ip_core_agg(p, a, c)
                 dev_c = a_node.intf(f'a{p}{a}-to-c{c}').name
-                nexthops.append(f"nexthop via {core_ip.split('/') [0]} dev {dev_c} weight 1")
+                nexthops.append(
+                    f"nexthop via {core_ip.split('/')[0]} dev {dev_c} weight 1"
+                )
             a_node.cmd('ip route replace default ' + ' '.join(nexthops))
 
     # Core routes to every rack via appropriate Agg
-    for c in range(4):
+    for c in range(n_cores):
         c_node = cores[c]
-        a_grp = 0 if c in (0, 1) else 1
-        for p in range(4):
-            agg_ip, _ = ip_core_agg(p, a_grp, c)
-            dev = c_node.intf(f'c{c}-to-a{p}{a_grp}').name
-            for e in range(2):
+        a = c % n_core_per_group
+        for p in range(n_pods):
+            agg_ip, _ = ip_core_agg(p, a, c)
+            dev = c_node.intf(f'c{c}-to-a{p}{a}').name
+            for e in range(n_edge_per_pod):
                 subnet = net_24(p, e)
-                c_node.cmd(f"ip route replace {subnet} via {agg_ip.split('/') [0]} dev {dev}")
+                c_node.cmd(f"ip route replace {subnet} via {agg_ip.split('/')[0]} dev {dev}")
 
 
 def build_fattree_topology(
@@ -320,11 +368,13 @@ def build_fattree_topology(
     delay: str = '0.2ms',
     queue_pkts: int = 150,
     start: bool = True,
+    k: int = 4,
 ) -> FatTreeContext:
-    """Construct the k=4 Fat-Tree with the specified TCLink parameters."""
+    """Construct a k-ary Fat-Tree with the specified TCLink parameters."""
+    _fattree_dims(k)  # validates k early
     link_params = dict(cls=TCLink, bw=bw_mbps, delay=delay, max_queue_size=queue_pkts, use_htb=True)
     net = Mininet(link=TCLink, build=False)
-    cores, aggs, edges, hosts = create_nodes_and_links(net, link_params)
+    cores, aggs, edges, hosts = create_nodes_and_links(net, link_params, k=k)
     net.build()
 
     ctx = FatTreeContext(
@@ -333,14 +383,15 @@ def build_fattree_topology(
         aggs=aggs,
         edges=edges,
         hosts=hosts,
+        k=k,
         link_params=link_params,
     )
 
     tune_sysctls(ctx.routers())
-    setup_edge_tor(ctx.edges)
+    setup_edge_tor(ctx.edges, k=k)
     disable_offloads(ctx.routers() + flatten(ctx.hosts))
-    assign_addresses(ctx.cores, ctx.aggs, ctx.edges, ctx.hosts)
-    install_routes_ecmp(ctx.cores, ctx.aggs, ctx.edges)
+    assign_addresses(ctx.cores, ctx.aggs, ctx.edges, ctx.hosts, k=k)
+    install_routes_ecmp(ctx.cores, ctx.aggs, ctx.edges, k=k)
     if start:
         net.start()
     return ctx

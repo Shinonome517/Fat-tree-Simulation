@@ -1,3 +1,4 @@
+import os
 from typing import Iterator, Tuple
 
 import pytest
@@ -5,14 +6,31 @@ import pytest
 import mininet_fattree_k4 as fattree
 from test.util_debug import DumpSpec, fail_with_dumps
 
+K = int(os.environ.get("FATTREE_K", "4"))
+assert K % 2 == 0 and 2 <= K <= 16
+N_PODS = K
+N_AGG_PER_POD = K // 2
+N_EDGE_PER_POD = K // 2
+N_HOSTS_PER_EDGE = K // 2
+N_CORE_GROUPS = K // 2
+N_CORE_PER_GROUP = K // 2
+N_CORES = N_CORE_GROUPS * N_CORE_PER_GROUP
+TOTAL_HOSTS = N_PODS * N_EDGE_PER_POD * N_HOSTS_PER_EDGE
+EXHAUSTIVE_HOST_LIMIT = 64
+if TOTAL_HOSTS > EXHAUSTIVE_HOST_LIMIT:
+    pytest.skip(
+        f"Host matrix too large for exhaustive connectivity test (k={K}, hosts={TOTAL_HOSTS}).",
+        allow_module_level=True,
+    )
+
 
 def _host_cases() -> Iterator[Tuple[int, int, int, int, int, int]]:
-    for sp in range(4):
-        for se in range(2):
-            for sh in range(2):
-                for dp in range(4):
-                    for de in range(2):
-                        for dh in range(2):
+    for sp in range(N_PODS):
+        for se in range(N_EDGE_PER_POD):
+            for sh in range(N_HOSTS_PER_EDGE):
+                for dp in range(N_PODS):
+                    for de in range(N_EDGE_PER_POD):
+                        for dh in range(N_HOSTS_PER_EDGE):
                             if (sp, se, sh) == (dp, de, dh):
                                 continue
                             yield sp, se, sh, dp, de, dh

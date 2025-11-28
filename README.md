@@ -1,6 +1,6 @@
 # Fat-Tree Simulation Docker イメージ（Mininet + picoquic）
 
-このリポジトリはUbuntu 22.04 ホスト上で Mininet と picoquic を動かすための Docker イメージと、Fat-Tree (k=4) をエミュレートするためのスクリプトを提供します。  
+このリポジトリはUbuntu 22.04 ホスト上で Mininet と picoquic を動かすための Docker イメージと、Fat-Tree (デフォルト k=4、偶数 k<=16 に対応) をエミュレートするためのスクリプトを提供します。  
 
 コンテナはホストのカーネルモジュールを共有する構成で起動する必要があり、`--privileged` / `--network=host` / `-v /lib/modules:/lib/modules` を付与するのが必須です。
 
@@ -73,6 +73,7 @@ sudo python3 main.py --cli
 - `--bw` (デフォルト: 1000 Mbps)
 - `--delay` (デフォルト: 0.2ms)
 - `--q` (デフォルト: 150 パケット)
+- `-k`/`--k` (デフォルト: 4; 偶数かつ 2〜16 の範囲で Fat-Tree の k を指定)
 - `--cli` を付けない場合はヘッドレスで常駐
 
 停止は `Ctrl+C`。
@@ -105,3 +106,6 @@ picoquicdemo -h
 ```bash
 sudo pytest -q
 ```
+
+- Fat-Tree の k を変える場合: `FATTREE_K=8 sudo pytest -q` のように環境変数で指定（偶数 2〜16）。
+- `@pytest.mark.slow` は長時間/トラフィック多めのテスト（例: 全ホスト疎通、ECMP 負荷分散）。時間を節約する場合は `sudo pytest -q -m "not slow"` で除外できます。

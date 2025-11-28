@@ -1,3 +1,4 @@
+import os
 from typing import List, Tuple
 
 import pytest
@@ -6,41 +7,51 @@ import mininet_fattree_k4 as fattree
 from test.util_addr import ipv4_addrs
 from test.util_debug import DumpSpec, fail_with_dumps
 
+K = int(os.environ.get("FATTREE_K", "4"))
+assert K % 2 == 0 and 2 <= K <= 16
+N_PODS = K
+N_AGG_PER_POD = K // 2
+N_EDGE_PER_POD = K // 2
+N_HOSTS_PER_EDGE = K // 2
+N_CORE_GROUPS = K // 2
+N_CORE_PER_GROUP = K // 2
+N_CORES = N_CORE_GROUPS * N_CORE_PER_GROUP
 
 EDGE_SVI_CASES: List[Tuple[int, int, str, str]] = [
-    (p, e, f"br_e{p}{e}", fattree.svi_ip(p, e)) for p in range(4) for e in range(2)
+    (p, e, f"br_e{p}{e}", fattree.svi_ip(p, e)) for p in range(N_PODS) for e in range(N_EDGE_PER_POD)
 ]
 
 EDGE_DOWNLINK_CASES: List[Tuple[int, int, int, str]] = [
-    (p, e, h, f"e{p}{e}-h{h}") for p in range(4) for e in range(2) for h in range(2)
+    (p, e, h, f"e{p}{e}-h{h}") for p in range(N_PODS) for e in range(N_EDGE_PER_POD) for h in range(N_HOSTS_PER_EDGE)
 ]
 
 HOST_ADDRESS_CASES: List[Tuple[int, int, int, str, str]] = [
     (p, e, h, f"h{p}{e}{h}-eth0", fattree.host_ip(p, e, h))
-    for p in range(4)
-    for e in range(2)
-    for h in range(2)
+    for p in range(N_PODS)
+    for e in range(N_EDGE_PER_POD)
+    for h in range(N_HOSTS_PER_EDGE)
 ]
 
 EDGE_TO_AGG_CASES: List[Tuple[int, int, int, str, str]] = []
-for p in range(4):
-    for e in range(2):
-        for a in range(2):
+for p in range(N_PODS):
+    for e in range(N_EDGE_PER_POD):
+        for a in range(N_AGG_PER_POD):
             edge_ip, _ = fattree.ip_agg_edge(p, a, e)
             EDGE_TO_AGG_CASES.append((p, e, a, f"e{p}{e}-to-a{p}{a}", edge_ip))
 
 AGG_TO_EDGE_CASES: List[Tuple[int, int, int, str, str]] = []
-for p in range(4):
-    for a in range(2):
-        for e in range(2):
+for p in range(N_PODS):
+    for a in range(N_AGG_PER_POD):
+        for e in range(N_EDGE_PER_POD):
             _, agg_ip = fattree.ip_agg_edge(p, a, e)
             AGG_TO_EDGE_CASES.append((p, a, e, f"a{p}{a}-to-e{p}{e}", agg_ip))
 
 AGG_TO_CORE_CASES: List[Tuple[int, int, int, str, str]] = []
 CORE_TO_AGG_CASES: List[Tuple[int, int, int, str, str]] = []
-for p in range(4):
-    for a, cores in ((0, (0, 1)), (1, (2, 3))):
-        for c in cores:
+for p in range(N_PODS):
+    for a in range(N_AGG_PER_POD):
+        for i in range(N_CORE_GROUPS):
+            c = i * N_CORE_PER_GROUP + a
             agg_ip, core_ip = fattree.ip_core_agg(p, a, c)
             AGG_TO_CORE_CASES.append((p, a, c, f"a{p}{a}-to-c{c}", agg_ip))
             CORE_TO_AGG_CASES.append((p, c, a, f"c{c}-to-a{p}{a}", core_ip))

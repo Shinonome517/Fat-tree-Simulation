@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entrypoint for the k=4 Fat-Tree Mininet topology."""
+"""CLI entrypoint for the Fat-Tree Mininet topology."""
 
 import argparse
 
@@ -12,10 +12,18 @@ __all__ = ['parse_args', 'main']
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='FatTree k=4 Mininet topology (headless by default).')
+    parser = argparse.ArgumentParser(description='FatTree Mininet topology (headless by default).')
     parser.add_argument('--bw', type=int, default=1000, help='Link bandwidth in Mbps (default: 1000).')
     parser.add_argument('--delay', default='0.2ms', help="Link delay applied to all links (default: '0.2ms').")
     parser.add_argument('--q', type=int, default=150, metavar='PKTS', help='Max queue size in packets (default: 150).')
+    parser.add_argument(
+        '-k',
+        '--k',
+        type=int,
+        default=4,
+        metavar='EVEN',
+        help='Even fat-tree k (2-16) to build (default: 4).',
+    )
     parser.add_argument('--cli', action='store_true', help='Drop into Mininet CLI after bringing up the topology.')
     return parser.parse_args()
 
@@ -23,7 +31,13 @@ def parse_args():
 def main():
     args = parse_args()
     setLogLevel('info')
-    ctx = build_fattree_topology(bw_mbps=args.bw, delay=args.delay, queue_pkts=args.q, start=True)
+    ctx = build_fattree_topology(
+        bw_mbps=args.bw,
+        delay=args.delay,
+        queue_pkts=args.q,
+        start=True,
+        k=args.k,
+    )
     try:
         if args.cli:
             run_cli(ctx.net)
