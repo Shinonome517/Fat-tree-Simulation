@@ -12,6 +12,7 @@ This module focuses purely on building and tearing down the topology:
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from mininet.log import info
 from mininet.link import TCLink
 from mininet.net import Mininet
 from mininet.node import Node
@@ -34,6 +35,8 @@ __all__ = [
     'stop_fattree_topology',
     'flatten',
 ]
+
+PROGRESS_STEP = 25
 
 
 class LinuxRouter(Node):
@@ -91,6 +94,12 @@ def flatten(nested):
         else:
             result.append(item)
     return result
+
+
+def _progress(count: int, total: int) -> None:
+    """Emit progress as [done/total] every PROGRESS_STEP items (and at the end), with newline."""
+    if count % PROGRESS_STEP == 0 or count == total:
+        info(f'[{count}/{total}]\n')
 
 
 def _fattree_dims(k: int):
@@ -156,27 +165,59 @@ def create_nodes_and_links(
     ) = _fattree_dims(k)
     link_params = link_params or {}
 
-    cores = [net.addHost(f'c{c}', cls=LinuxRouter, ip=None) for c in range(n_cores)]
-    aggs = [
-        [net.addHost(f'a{p}{a}', cls=LinuxRouter, ip=None) for a in range(n_agg_per_pod)]
-        for p in range(n_pods)
-    ]
-    edges = [
-        [net.addHost(f'e{p}{e}', cls=LinuxRouter, ip=None) for e in range(n_edge_per_pod)]
-        for p in range(n_pods)
-    ]
-    hosts = [
-        [
-            [
-                net.addHost(f'h{p}{e}{h}', ip=None)
-                for h in range(n_hosts_per_edge)
-            ]
-            for e in range(n_edge_per_pod)
-        ]
-        for p in range(n_pods)
-    ]
+    cores: List[Node] = []
+    info(f'*** Creating {n_cores} core routers (progress every {PROGRESS_STEP}, format [done/total])\n')
+    for c in range(n_cores):
+        cores.append(net.addHost(f'c{c}', cls=LinuxRouter, ip=None))
+        _progress(c + 1, n_cores)
+    info('\n')
+
+    aggs: List[List[Node]] = []
+    total_aggs = n_pods * n_agg_per_pod
+    agg_count = 0
+    info(f'*** Creating {total_aggs} aggregation routers (progress every {PROGRESS_STEP}, format [done/total])\n')
+    for p in range(n_pods):
+        pod_aggs = []
+        for a in range(n_agg_per_pod):
+            pod_aggs.append(net.addHost(f'a{p}{a}', cls=LinuxRouter, ip=None))
+            agg_count += 1
+            _progress(agg_count, total_aggs)
+        aggs.append(pod_aggs)
+    info('\n')
+
+    edges: List[List[Node]] = []
+    total_edges = n_pods * n_edge_per_pod
+    edge_count = 0
+    info(f'*** Creating {total_edges} edge routers (progress every {PROGRESS_STEP}, format [done/total])\n')
+    for p in range(n_pods):
+        pod_edges = []
+        for e in range(n_edge_per_pod):
+            pod_edges.append(net.addHost(f'e{p}{e}', cls=LinuxRouter, ip=None))
+            edge_count += 1
+            _progress(edge_count, total_edges)
+        edges.append(pod_edges)
+    info('\n')
+
+    hosts: List[List[List[Node]]] = []
+    total_hosts = n_pods * n_edge_per_pod * n_hosts_per_edge
+    host_count = 0
+    info(f'*** Creating {total_hosts} hosts (progress every {PROGRESS_STEP}, format [done/total])\n')
+    for p in range(n_pods):
+        pod_hosts = []
+        for e in range(n_edge_per_pod):
+            edge_hosts = []
+            for h in range(n_hosts_per_edge):
+                edge_hosts.append(net.addHost(f'h{p}{e}{h}', ip=None))
+                host_count += 1
+                _progress(host_count, total_hosts)
+            pod_hosts.append(edge_hosts)
+        hosts.append(pod_hosts)
+    info('\n')
 
     # Edge–Host links
+    total_edge_host_links = n_pods * n_edge_per_pod * n_hosts_per_edge
+    edge_host_link_count = 0
+    info(f'*** Creating {total_edge_host_links} edge-host links (progress every {PROGRESS_STEP}, format [done/total])\n')
     for p in range(n_pods):
         for e in range(n_edge_per_pod):
             for h in range(n_hosts_per_edge):
@@ -187,8 +228,14 @@ def create_nodes_and_links(
                     intfName2=f'h{p}{e}{h}-eth0',
                     **link_params,
                 )
+                edge_host_link_count += 1
+                _progress(edge_host_link_count, total_edge_host_links)
+    info('\n')
 
     # Agg–Edge links (within pod)
+    total_agg_edge_links = n_pods * n_agg_per_pod * n_edge_per_pod
+    agg_edge_link_count = 0
+    info(f'*** Creating {total_agg_edge_links} agg-edge links (progress every {PROGRESS_STEP}, format [done/total])\n')
     for p in range(n_pods):
         for a in range(n_agg_per_pod):
             for e in range(n_edge_per_pod):
@@ -199,8 +246,14 @@ def create_nodes_and_links(
                     intfName2=f'e{p}{e}-to-a{p}{a}',
                     **link_params,
                 )
+                agg_edge_link_count += 1
+                _progress(agg_edge_link_count, total_agg_edge_links)
+    info('\n')
 
     # Core–Agg links (cross-pod)
+    total_core_agg_links = n_pods * n_agg_per_pod * n_core_groups
+    core_agg_link_count = 0
+    info(f'*** Creating {total_core_agg_links} core-agg links (progress every {PROGRESS_STEP}, format [done/total])\n')
     for p in range(n_pods):
         for a in range(n_agg_per_pod):
             for i in range(n_core_groups):
@@ -212,6 +265,9 @@ def create_nodes_and_links(
                     intfName2=f'a{p}{a}-to-c{c}',
                     **link_params,
                 )
+                core_agg_link_count += 1
+                _progress(core_agg_link_count, total_core_agg_links)
+    info('\n')
 
     return cores, aggs, edges, hosts
 
