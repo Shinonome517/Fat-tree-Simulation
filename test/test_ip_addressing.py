@@ -3,7 +3,7 @@ from typing import List, Tuple
 
 import pytest
 
-import mininet_fattree_k4 as fattree
+import topology as fattree
 from test.util_addr import ipv4_addrs
 from test.util_debug import DumpSpec, fail_with_dumps
 

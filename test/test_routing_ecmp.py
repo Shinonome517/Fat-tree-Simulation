@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple
 
 import pytest
 
-import mininet_fattree_k4 as fattree
+import topology as fattree
 from test.util_debug import DumpSpec, fail_with_dumps
 from test.util_routing import has_multipath
 from test.util_stats import tx_bytes_kernel

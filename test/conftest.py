@@ -5,7 +5,7 @@ import pytest
 from mininet.link import TCLink
 from mininet.net import Mininet
 
-import mininet_fattree_k4 as fattree
+import topology as fattree
 
 if os.geteuid() != 0:
     pytest.skip("Mininet requires root privileges", allow_module_level=True)

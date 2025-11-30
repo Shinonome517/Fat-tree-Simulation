@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 import pytest
 
-import mininet_fattree_k4 as fattree
+import topology as fattree
 from test.util_debug import DumpSpec, fail_with_dumps
 
 K = int(os.environ.get("FATTREE_K", "4"))
