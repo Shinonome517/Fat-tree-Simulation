@@ -25,8 +25,8 @@ EDGE_DOWNLINK_CASES: List[Tuple[int, int, int, str]] = [
     (p, e, h, f"e{p}{e}-h{h}") for p in range(N_PODS) for e in range(N_EDGE_PER_POD) for h in range(N_HOSTS_PER_EDGE)
 ]
 
-HOST_ADDRESS_CASES: List[Tuple[int, int, int, str, str]] = [
-    (p, e, h, f"h{p}{e}{h}-eth0", fattree.host_ip(p, e, h))
+HOST_ADDRESS_CASES: List[Tuple[int, int, int, str, List[str]]] = [
+    (p, e, h, f"h{p}{e}{h}-eth0", fattree.host_ips(p, e, h))
     for p in range(N_PODS)
     for e in range(N_EDGE_PER_POD)
     for h in range(N_HOSTS_PER_EDGE)
@@ -94,7 +94,7 @@ def test_edge_downlink_interfaces_have_no_ipv4(fattree_net, pod_idx, edge_idx, _
 def test_host_interface_addresses(fattree_net, pod_idx, edge_idx, host_idx, iface, expected):
     host = fattree_net["hosts"][pod_idx][edge_idx][host_idx]
     addrs = ipv4_addrs(host, iface)
-    if addrs != [expected]:
+    if sorted(addrs) != sorted(expected):
         fail_with_dumps(
             f"{host.name}:{iface} expected {expected}, got {addrs}",
             [

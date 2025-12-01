@@ -24,6 +24,7 @@ __all__ = [
     'ip_agg_edge',
     'svi_ip',
     'host_ip',
+    'host_ips',
     'net_24',
     'create_nodes_and_links',
     'tune_sysctls',
@@ -76,9 +77,31 @@ def svi_ip(p: int, e: int) -> str:
 
 
 def host_ip(p: int, e: int, hidx: int) -> str:
-    # Hosts start at .1 and increment per attached host
-    host = 1 + hidx
-    return f'10.{p}.{e}.{host}/24'
+    """
+    Return the primary /24 IP address for host h{p}{e}{hidx}.
+
+    Each host is allocated a block of 4 consecutive addresses inside the
+    rack's /24 subnet 10.p.e.0/24.
+
+    Example (p=0, e=0):
+      h000 (hidx=0) -> 10.0.0.1-10.0.0.4, primary = 10.0.0.1/24
+      h001 (hidx=1) -> 10.0.0.5-10.0.0.8, primary = 10.0.0.5/24
+    """
+    base = 1 + 4 * hidx
+    return f"10.{p}.{e}.{base}/24"
+
+
+def host_ips(p: int, e: int, hidx: int) -> List[str]:
+    """
+    Return all /24 IP addresses assigned to host h{p}{e}{hidx}.
+
+    Each host gets 4 consecutive addresses inside 10.p.e.0/24:
+      h000 -> 10.p.e.1-10.p.e.4
+      h001 -> 10.p.e.5-10.p.e.8
+      ...
+    """
+    base = 1 + 4 * hidx
+    return [f"10.{p}.{e}.{base + i}/24" for i in range(4)]
 
 
 def net_24(p: int, e: int) -> str:
@@ -328,10 +351,21 @@ def assign_addresses(cores, aggs, edges, hosts, k: int = 4) -> None:
             edge_node.cmd(f'ip addr replace {svi_ip(p, e)} dev {bridge}')
             gateway = svi_ip(p, e).split('/')[0]
             for h in range(n_hosts_per_edge):
-                iface = f'h{p}{e}{h}-eth0'
+                iface = f"h{p}{e}{h}-eth0"
                 h_node = hosts[p][e][h]
-                h_node.setIP(intf=iface, ip=host_ip(p, e, h))
-                h_node.setDefaultRoute(f'via {gateway}')
+
+                # Each host gets 4 IPs inside 10.p.e.0/24.
+                ips = host_ips(p, e, h)
+
+                # Primary IP via Mininet helper (also updates /proc etc.).
+                h_node.setIP(intf=iface, ip=ips[0])
+
+                # Remaining IPs as secondary addresses on the same iface.
+                for extra_ip in ips[1:]:
+                    h_node.cmd(f"ip addr add {extra_ip} dev {iface}")
+
+                # Default route is unchanged: use the SVI as the gateway.
+                h_node.setDefaultRoute(f"via {gateway}")
 
     # Agg–Edge /31 links
     for p in range(n_pods):
@@ -388,6 +422,7 @@ def install_routes_ecmp(cores, aggs, edges, k: int = 4) -> None:
         for a in range(n_agg_per_pod):
             a_node = aggs[p][a]
             # Pod-local /24 networks via edges
+            # Note: hosts may own multiple IPs within 10.p.e.0/24, but routing stays /24-based.
             for e in range(n_edge_per_pod):
                 subnet = net_24(p, e)
                 edge_ip, _ = ip_agg_edge(p, a, e)
@@ -416,6 +451,7 @@ def install_routes_ecmp(cores, aggs, edges, k: int = 4) -> None:
             dev = c_node.intf(f'c{c}-to-a{p}{a}').name
             for e in range(n_edge_per_pod):
                 subnet = net_24(p, e)
+                # Hosts have multiple IPs inside each rack /24; ECMP remains per /24 subnet.
                 c_node.cmd(f"ip route replace {subnet} via {agg_ip.split('/')[0]} dev {dev}")
 
 

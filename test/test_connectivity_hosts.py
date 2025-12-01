@@ -73,3 +73,46 @@ def test_all_hosts_reach_each_other(
         f"{description} ping failed (target {dst_ip})\n\n{ping_output.strip()}",
         dumps,
     )
+
+
+def test_each_host_all_ips_reachable(fattree_net) -> None:
+    """
+    For every host, verify that all four assigned IPs are reachable from another host.
+    Uses a single primary source host (and an alternate if available) to keep runtime bounded.
+    """
+    all_hosts = [
+        (p, e, h) for p in range(N_PODS) for e in range(N_EDGE_PER_POD) for h in range(N_HOSTS_PER_EDGE)
+    ]
+    assert all_hosts, "No hosts available for connectivity test"
+
+    primary_src = all_hosts[0]
+    alternate_src = all_hosts[1] if len(all_hosts) > 1 else all_hosts[0]
+
+    def get_host(triple):
+        p, e, h = triple
+        return fattree_net["hosts"][p][e][h]
+
+    for dst_tuple in all_hosts:
+        # Ensure we probe each destination from a (mostly) fixed source; if the destination is the primary source,
+        # switch to the alternate to keep the probe cross-host when possible.
+        src_tuple = alternate_src if dst_tuple == primary_src and len(all_hosts) > 1 else primary_src
+        src = get_host(src_tuple)
+        dst = get_host(dst_tuple)
+
+        dst_ips = fattree.host_ips(*dst_tuple)
+        for ip_cidr in dst_ips:
+            ip = ip_cidr.split("/")[0]
+            description = f"h{src_tuple[0]}{src_tuple[1]}{src_tuple[2]} -> h{dst_tuple[0]}{dst_tuple[1]}{dst_tuple[2]}:{ip}"
+            ping_output = src.cmd(f"ping -c1 -W1 {ip}")
+            if " 0% packet loss" in ping_output:
+                continue
+
+            src_iface = f"h{src_tuple[0]}{src_tuple[1]}{src_tuple[2]}-eth0"
+            fail_with_dumps(
+                f"{description} ping failed\n\n{ping_output.strip()}",
+                [
+                    DumpSpec(src, f"ip addr show dev {src_iface}", label=f"{description} src ip addr"),
+                    DumpSpec(src, "ip route show", label=f"{description} src routes"),
+                    DumpSpec(dst, "ip addr show", label=f"{description} dst ip addr"),
+                ],
+            )
