@@ -12,7 +12,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import matplotlib
 import numpy as np
@@ -279,6 +279,13 @@ def compute_fairness(link_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(fairness_rows)
 
 
+def _plot_cdf(ax, values: np.ndarray, label: str):
+    values = np.sort(values)
+    y = np.arange(1, len(values) + 1) / len(values)
+    (line,) = ax.step(values, y, where="post", label=label)
+    return line
+
+
 def plot_goodput_bar(
     elephant_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
 ) -> None:
@@ -319,9 +326,23 @@ def plot_fct_cdf(
         if subset.empty:
             logging.warning("No mouse FCT data for %s", proto)
             continue
-        values = np.sort(subset["fct_s"].to_numpy())
-        y = np.arange(1, len(values) + 1) / len(values)
-        ax.step(values, y, where="post", label=proto)
+        values = subset["fct_s"].to_numpy()
+        if values.size == 0:
+            continue
+        line = _plot_cdf(ax, values, proto)
+        color = line.get_color()
+        p50 = np.percentile(values, 50)
+        p90 = np.percentile(values, 90)
+        p99 = np.percentile(values, 99)
+        ax.scatter(
+            [p50, p90, p99],
+            [0.5, 0.9, 0.99],
+            color=color,
+            marker="x",
+            s=25,
+            label=f"{proto} p50/p90/p99",
+        )
+        line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
         has_data = True
 
     if not has_data:
@@ -350,6 +371,8 @@ def plot_fct_histogram(
         return
 
     has_data = False
+    percentile_annos: List[Tuple[str, Tuple[float, float, float], Any]] = []
+    max_count = 0.0
     all_values_ms = (mouse_df["fct_s"] * 1000).to_numpy()
     bins = (
         np.histogram_bin_edges(all_values_ms, bins="auto") if all_values_ms.size else None
@@ -363,7 +386,7 @@ def plot_fct_histogram(
         values_ms = subset["fct_s"].to_numpy() * 1000
         if values_ms.size == 0:
             continue
-        ax.hist(
+        counts, _, patches = ax.hist(
             values_ms,
             bins=bins if bins is not None and bins.size > 1 else "auto",
             alpha=0.65,
@@ -371,11 +394,41 @@ def plot_fct_histogram(
             edgecolor="black",
             linewidth=0.5,
         )
+        max_count = max(max_count, float(np.max(counts)) if counts.size else 0.0)
+        p50, p90, p99 = np.percentile(values_ms, [50, 90, 99])
+        color = patches[0].get_facecolor() if patches else "C0"
+        label = f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})"
+        if patches:
+            patches[0].set_label(label)
+            for patch in patches[1:]:
+                patch.set_label("_nolegend_")
+        percentile_annos.append((proto, (p50, p90, p99), color))
         has_data = True
 
     if not has_data:
         ax.text(0.5, 0.5, "No mouse data", ha="center", va="center")
     else:
+        marker_y = max_count * 1.05 if max_count > 0 else 1.0
+        for proto, values, color in percentile_annos:
+            p50, p90, p99 = values
+            ax.vlines(
+                [p50, p90, p99],
+                ymin=0,
+                ymax=marker_y,
+                colors=color,
+                linestyles="--",
+                linewidth=1,
+                alpha=0.8,
+            )
+            ax.scatter(
+                [p50, p90, p99],
+                [marker_y] * 3,
+                color=color,
+                marker="x",
+                s=25,
+                label=f"{proto} p50/p90/p99",
+            )
+        ax.set_ylim(top=marker_y * 1.1)
         ax.set_xlabel("FCT (ms)")
         ax.set_ylabel("Frequency")
         ax.set_title("Mouse FCT Distribution")

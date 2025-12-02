@@ -10,6 +10,7 @@ import json
 import random
 import re
 import shlex
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -296,6 +297,36 @@ def _terminate_processes(procs: List) -> None:
                 pass
 
 
+def _wait_for_completion_then_terminate(
+    proc, wait_timeout: float, label: str = "", term_timeout: float = 3.0
+) -> None:
+    """Wait for a proc to exit; send SIGTERM/SIGKILL only if it overruns."""
+    if not proc:
+        return
+    prefix = f"{label} " if label else ""
+    try:
+        proc.wait(timeout=wait_timeout)
+        return
+    except subprocess.TimeoutExpired:
+        print(f"{prefix}still running after {wait_timeout}s; sending SIGTERM.")
+    except Exception as exc:
+        print(f"{prefix}error while waiting: {exc}; sending SIGTERM.")
+    try:
+        proc.terminate()
+        proc.wait(timeout=term_timeout)
+    except subprocess.TimeoutExpired:
+        print(f"{prefix}still alive after SIGTERM; sending SIGKILL.")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _run_mouse_flows(
     host,
     server_ip: str,
@@ -552,8 +583,9 @@ def run_whitebox_once(
         if mouse_thread:
             mouse_thread.join()
 
-        if elephant_client_proc:
-            elephant_client_proc.wait(timeout=5)
+        _wait_for_completion_then_terminate(
+            elephant_client_proc, wait_timeout=5, label=f"{run_tag} elephant client"
+        )
 
         after_stats = snapshot_switch_bytes(ctx)
         (log_dir / "switch_stats_after.json").write_text(
@@ -573,7 +605,7 @@ def run_whitebox_once(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Whitebox experiment driver.")
     parser.add_argument("--proto", required=True, choices=["quic", "mpquic"])
-    parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument("--runs", type=int, default=4)
     parser.add_argument("--k", type=int, default=4)
     parser.add_argument("--duration", type=float, default=60.0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)

@@ -8,6 +8,7 @@ import argparse
 import json
 import random
 import shlex
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -63,22 +64,57 @@ def _format_extra_args(extra_args: Union[Iterable[str], str, None]) -> str:
     return " ".join(shlex.quote(str(a)) for a in extra_args if str(a))
 
 
+def _normalize_extra_args(extra_args) -> List[str]:
+    if not extra_args:
+        return []
+    if isinstance(extra_args, str):
+        return [extra_args.strip()] if extra_args.strip() else []
+    return [str(a) for a in extra_args if str(a)]
+
+
+def _is_udp_listening(host, port: int) -> Tuple[bool, str]:
+    """
+    Check if a UDP listener exists on the given port inside a host namespace.
+    Returns (is_listening, raw_output_snippet).
+    """
+    out = host.cmd(f"ss -H -lun 'sport = :{port}' 2>/dev/null || true").strip()
+    if out:
+        return True, out
+    # Fallback to netstat for environments lacking ss details.
+    netstat_out = host.cmd(f"netstat -lun 2>/dev/null | grep ':{port} ' || true").strip()
+    return bool(netstat_out), netstat_out
+
+
 def _start_picoquic_server(
-    host, port: int, log_path: Path, template: str, extra_args, enable_qlog: bool
+    host, port: int, log_path: Path, extra_args, enable_qlog: bool
 ) -> object:
-    qlog_flag = ""
+    # Build argv directly so we can run without a shell and kill reliably later.
+    args: List[str] = ["picoquicdemo", "-a", "server", "-p", str(port)]
+    qlog_path = None
     if enable_qlog:
         qlog_path = Path(f"{log_path}.qlog")
-        qlog_flag = f"-l {shlex.quote(str(qlog_path))}"
-    cmd = template.format(
-        port=port,
-        log_path=shlex.quote(str(log_path)),
-        qlog_flag=qlog_flag,
-        extra=_format_extra_args(extra_args),
-        cert=PICOQUIC_CERT_PATH,
-        key=PICOQUIC_KEY_PATH,
-    )
-    return host.popen(cmd, shell=True)
+        args.extend(["-l", str(qlog_path)])
+    args.extend(["-c", PICOQUIC_CERT_PATH, "-k", PICOQUIC_KEY_PATH])
+    args.extend(_normalize_extra_args(extra_args))
+
+    with log_path.open("w") as log_file:
+        proc = host.popen(args, stdout=log_file, stderr=subprocess.STDOUT, shell=False)
+    return proc
+
+
+def _verify_udp_servers(hosts: Iterable, port: int, label: str) -> None:
+    """
+    Ensure each host has a UDP listener on the given port. Raises RuntimeError otherwise.
+    """
+    missing: List[str] = []
+    for h in hosts:
+        ok, raw = _is_udp_listening(h, port)
+        if not ok:
+            missing.append(f"{h.name} (udp/{port}) [{raw or 'no ss output'}]")
+    if missing:
+        raise RuntimeError(
+            f"{label} server(s) not listening: " + ", ".join(missing)
+        )
 
 
 def _terminate_processes(procs: List[object]) -> None:
@@ -99,6 +135,36 @@ def _terminate_processes(procs: List[object]) -> None:
                 proc.kill()
             except Exception:
                 pass
+
+
+def _wait_for_completion_then_terminate(
+    proc, wait_timeout: float, label: str = "", term_timeout: float = 3.0
+) -> None:
+    """Wait for a proc to exit; only terminate/kill if it exceeds the wait."""
+    if not proc:
+        return
+    prefix = f"{label} " if label else ""
+    try:
+        proc.wait(timeout=wait_timeout)
+        return
+    except subprocess.TimeoutExpired:
+        print(f"{prefix}still running after {wait_timeout}s; sending SIGTERM.")
+    except Exception as exc:
+        print(f"{prefix}error while waiting: {exc}; sending SIGTERM.")
+    try:
+        proc.terminate()
+        proc.wait(timeout=term_timeout)
+    except subprocess.TimeoutExpired:
+        print(f"{prefix}still alive after SIGTERM; sending SIGKILL.")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def _pick_random_pairs(hosts: Sequence, count: int) -> List[Tuple]:
@@ -155,8 +221,9 @@ def _mouse_generator(
             csv_path=csv_path,
             scenario=scenario,
             extra_args=EXTRA_ARGS_MOUSE,
+            as_list=True,
         )
-        proc = src_host.popen(mouse_cmd, shell=True)
+        proc = src_host.popen(mouse_cmd, shell=False)
         proc_store.append(proc)
         # Drop completed processes to keep the list small.
         proc_store[:] = [p for p in proc_store if p and p.poll() is None]
@@ -199,10 +266,13 @@ def _healthcheck(
         lines.append(msg)
 
     # Server presence
-    procs = server_host.cmd("pgrep -a picoquicdemo")
+    procs = server_host.cmd(f"pgrep -fa 'picoquicdemo.*-p {port}'")
     procs_clean = procs.strip()
     server_ok = bool(procs_clean)
-    _log(f"[health:{label}] server procs: {procs_clean or 'none'}")
+    _log(f"[health:{label}] server procs (port {port}): {procs_clean or 'none'}")
+
+    listen_ok, listen_raw = _is_udp_listening(server_host, port)
+    _log(f"[health:{label}] listen check udp/{port}: {listen_raw or 'none'}")
 
     # Ping reachability
     ping_out = client_host.cmd(f"ping -c1 -W1 {server_ip}; echo HC_RC=$?")
@@ -233,9 +303,9 @@ def _healthcheck(
 
     log_path.write_text("\n".join(lines) + "\n")
 
-    if not (server_ok and ping_ok and quic_ok):
+    if not (server_ok and listen_ok and ping_ok and quic_ok):
         raise RuntimeError(
-            f"healthcheck {label} failed (server_ok={server_ok}, ping_ok={ping_ok}, quic_ok={quic_ok}); "
+            f"healthcheck {label} failed (server_ok={server_ok}, listen_ok={listen_ok}, ping_ok={ping_ok}, quic_ok={quic_ok}); "
             f"see {log_path}"
         )
 
@@ -284,6 +354,16 @@ def run_blackbox_once(
             f"{run_tag} selected pairs: elephants={len(elephant_pairs)}, mice={len(mouse_pairs)}"
         )
 
+        # Persist pair selection to ease debugging when flows fail.
+        pair_log = log_dir / "pair_map.txt"
+        with pair_log.open("w") as f:
+            f.write("Elephant pairs (src -> dst):\n")
+            for idx, (src, dst) in enumerate(elephant_pairs):
+                f.write(f"{idx:02d}: {src.name} -> {dst.name} (dst_ip={dst.IP()})\n")
+            f.write("\nMouse pairs (src -> dst):\n")
+            for idx, (src, dst) in enumerate(mouse_pairs):
+                f.write(f"{idx:02d}: {src.name} -> {dst.name} (dst_ip={dst.IP()})\n")
+
         elephant_server_hosts = {dst.name: dst for _, dst in elephant_pairs}.values()
         mouse_server_hosts = {dst.name: dst for _, dst in mouse_pairs}.values()
 
@@ -295,7 +375,6 @@ def run_blackbox_once(
                     host,
                     ELEPHANT_PORT,
                     log_path,
-                    ELEPHANT_SERVER_CMD_TEMPLATE,
                     _elephant_server_extra(proto),
                     enable_qlog,
                 )
@@ -307,11 +386,13 @@ def run_blackbox_once(
                     host,
                     MOUSE_PORT,
                     log_path,
-                    MOUSE_SERVER_CMD_TEMPLATE,
                     [],
                     enable_qlog,
                 )
             )
+
+        _verify_udp_servers(elephant_server_hosts, ELEPHANT_PORT, "elephant")
+        _verify_udp_servers(mouse_server_hosts, MOUSE_PORT, "mouse")
 
         start_time = time.time()
         elephant_extra = _elephant_client_extra(proto)
@@ -362,8 +443,9 @@ def run_blackbox_once(
                 csv_path=csv_path,
                 scenario=elephant_scenario,
                 extra_args=elephant_extra,
+                as_list=True,
             )
-            proc = src.popen(elephant_cmd, shell=True)
+            proc = src.popen(elephant_cmd, shell=False)
             elephant_procs.append(proc)
 
         print(f"{run_tag} starting mouse generator threads.")
@@ -396,15 +478,9 @@ def run_blackbox_once(
             thread.join()
 
         for proc in elephant_procs:
-            if not proc:
-                continue
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            _wait_for_completion_then_terminate(
+                proc, wait_timeout=5, label=f"{run_tag} elephant client"
+            )
 
         after_stats = snapshot_switch_bytes(ctx)
         (log_dir / "switch_stats_after.json").write_text(
@@ -429,7 +505,7 @@ def main() -> None:
     parser.add_argument("--proto", required=True, choices=["quic", "mpquic"])
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--k", type=int, default=4)
-    parser.add_argument("--duration", type=float, default=300.0)
+    parser.add_argument("--duration", type=float, default=180.0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--elephant-bytes",

@@ -80,17 +80,21 @@ def picoquic_perf_cmd(
     scenario: Optional[str] = "*1:1000:1000;",
     duration: Optional[float] = None,
     extra_args: Optional[Iterable[str]] = None,
-) -> str:
+    as_list: bool = False,
+) -> str | List[str]:
     """
-    Build a picoquicdemo perf-mode command string.
+    Build a picoquicdemo perf-mode command.
 
     Scenarios are the preferred way to drive perf tests. If scenario is provided,
     it is appended after the server host/port. If scenario is None and duration
     is provided, duration is passed via -t for backward compatibility.
     extra_args is appended as-is when non-empty, allowing callers to inject
     additional picoquicdemo flags.
+
+    If as_list is True, returns a list of argv components suitable for shell=False.
+    Otherwise, returns a shell-escaped string (historical behavior).
     """
-    parts = ["picoquicdemo", "-a", "perf"]
+    parts: List[str] = ["picoquicdemo", "-a", "perf"]
     if extra_args:
         # Preserve historical behavior if a string is passed; otherwise expand the iterable.
         if isinstance(extra_args, str):
@@ -98,10 +102,13 @@ def picoquic_perf_cmd(
         else:
             extras = [str(arg) for arg in extra_args if str(arg)]
         parts.extend(extras)
-    parts.extend(["-F", shlex.quote(str(csv_path))])
+    parts.extend(["-F", str(csv_path)])
     if duration is not None and scenario is None:
         parts.extend(["-t", str(duration)])
-    parts.extend([shlex.quote(str(server_ip)), str(server_port)])
+    parts.extend([str(server_ip), str(server_port)])
     if scenario:
-        parts.append(shlex.quote(str(scenario)))
-    return " ".join(parts)
+        parts.append(str(scenario))
+
+    if as_list:
+        return parts
+    return " ".join(shlex.quote(p) for p in parts)
