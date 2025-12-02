@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-pytest \
     git ca-certificates curl \
     build-essential cmake pkg-config ninja-build \
-    libssl-dev \
+    libssl-dev openssl \
     zsh \
     nftables \
     # あると便利な診断
@@ -32,6 +32,14 @@ RUN python3 -m pip install --no-cache-dir numpy pandas matplotlib
 # OVS/Mininet 用の sysctl（実行時に適用）
 RUN printf 'net.ipv4.ip_forward=1\nnet.core.rmem_max=268435456\nnet.core.wmem_max=268435456\n' \
     > /etc/sysctl.d/99-mininet.conf
+
+# 固定の自己署名証明書（picoquicdemo サーバ用）
+RUN mkdir -p /etc/picoquic && \
+    openssl req -x509 -newkey rsa:2048 -nodes \
+      -keyout /etc/picoquic/server-key.pem \
+      -out /etc/picoquic/server-cert.pem \
+      -days 3650 \
+      -subj "/CN=test/"
 
 # ---- picoquic を最新固定（2025-11-03 時点の master HEAD）+ サブモジュール shallow 取得 ----
 ARG PICOQUIC_COMMIT=73231489b616e61bef3733cc6b5953c2b91d5348

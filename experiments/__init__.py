@@ -3,7 +3,7 @@
 from pathlib import Path
 import shlex
 import time
-from typing import Dict, Optional
+from typing import Dict, Iterable, List, Optional
 
 from topology import FatTreeContext, build_fattree_topology
 
@@ -73,7 +73,7 @@ def picoquic_perf_cmd(
     server_port: int,
     csv_path: str,
     duration: Optional[float] = 60.0,
-    extra_args: str = "",
+    extra_args: Optional[Iterable[str]] = None,
 ) -> str:
     """
     Build a picoquicdemo perf-mode command string.
@@ -86,5 +86,10 @@ def picoquic_perf_cmd(
         parts.extend(["-t", str(duration)])
     parts.extend([shlex.quote(str(server_ip)), str(server_port)])
     if extra_args:
-        parts.append(extra_args.strip())
+        # Preserve historical behavior if a string is passed; otherwise expand the iterable.
+        if isinstance(extra_args, str):
+            extras: List[str] = [extra_args.strip()] if extra_args.strip() else []
+        else:
+            extras = [str(arg) for arg in extra_args if str(arg)]
+        parts.extend(extras)
     return " ".join(parts)
