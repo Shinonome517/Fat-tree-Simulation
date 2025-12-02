@@ -48,6 +48,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose logging.",
     )
+    parser.add_argument(
+        "--run-id",
+        action="append",
+        help=(
+            "Run ID(s) to include (e.g., run_20251202-074952). "
+            "Can be specified multiple times. "
+            "Default: use the latest run_* per protocol."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -67,6 +76,32 @@ def list_run_dirs(log_root: Path, proto: str) -> List[Path]:
     return sorted(
         [d for d in proto_dir.iterdir() if d.is_dir() and d.name.startswith("run_")]
     )
+
+
+def select_run_dirs(
+    log_root: Path, protos: Sequence[str], run_ids: Sequence[str] | None
+) -> Dict[str, List[Path]]:
+    run_dirs_by_proto: Dict[str, List[Path]] = {}
+    for proto in protos:
+        available = list_run_dirs(log_root, proto)
+        if not available:
+            logging.warning("No run_* directories found for %s under %s", proto, log_root)
+            run_dirs_by_proto[proto] = []
+            continue
+
+        if not run_ids:
+            selected = available[-1:]
+        else:
+            available_by_name = {d.name: d for d in available}
+            selected = []
+            for rid in run_ids:
+                path = available_by_name.get(rid)
+                if path is not None:
+                    selected.append(path)
+                else:
+                    logging.warning("Requested run_id %s not found under %s", rid, proto)
+        run_dirs_by_proto[proto] = selected
+    return run_dirs_by_proto
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -155,14 +190,21 @@ def load_switch_tx_deltas(
 
 
 def collect_all_data(
-    log_root: Path, protos: Sequence[str]
+    log_root: Path,
+    protos: Sequence[str],
+    run_dirs_by_proto: Mapping[str, Sequence[Path]] | None = None,
 ) -> Dict[str, pd.DataFrame]:
     elephant_rows: List[Dict[str, object]] = []
     mouse_rows: List[Dict[str, object]] = []
     link_rows: List[Dict[str, object]] = []
 
     for proto in protos:
-        for run_dir in list_run_dirs(log_root, proto):
+        run_dirs = (
+            run_dirs_by_proto.get(proto, [])
+            if run_dirs_by_proto is not None
+            else list_run_dirs(log_root, proto)
+        )
+        for run_dir in run_dirs:
             run_id = run_dir.name
             elephant_path = run_dir / "elephant_client.csv"
             mouse_paths = sorted(run_dir.glob("mouse_client_*.csv"))
@@ -294,6 +336,55 @@ def plot_fct_cdf(
     plt.close(fig)
 
 
+def plot_fct_histogram(
+    mouse_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
+) -> None:
+    fig, ax = plt.subplots(figsize=(6, 4))
+    required_cols = {"proto", "fct_s"}
+    if mouse_df.empty or not required_cols.issubset(mouse_df.columns):
+        ax.text(0.5, 0.5, "No mouse data", ha="center", va="center")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=200)
+        plt.close(fig)
+        return
+
+    has_data = False
+    all_values_ms = (mouse_df["fct_s"] * 1000).to_numpy()
+    bins = (
+        np.histogram_bin_edges(all_values_ms, bins="auto") if all_values_ms.size else None
+    )
+
+    for proto in protos:
+        subset = mouse_df[mouse_df["proto"] == proto]
+        if subset.empty:
+            logging.warning("No mouse FCT data for %s", proto)
+            continue
+        values_ms = subset["fct_s"].to_numpy() * 1000
+        if values_ms.size == 0:
+            continue
+        ax.hist(
+            values_ms,
+            bins=bins if bins is not None and bins.size > 1 else "auto",
+            alpha=0.65,
+            label=proto,
+            edgecolor="black",
+            linewidth=0.5,
+        )
+        has_data = True
+
+    if not has_data:
+        ax.text(0.5, 0.5, "No mouse data", ha="center", va="center")
+    else:
+        ax.set_xlabel("FCT (ms)")
+        ax.set_ylabel("Frequency")
+        ax.set_title("Mouse FCT Distribution")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
 def plot_link_heatmap(
     link_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
 ) -> None:
@@ -398,7 +489,29 @@ def main() -> None:
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    data = collect_all_data(args.log_root, PROTO_ORDER)
+    run_dirs_by_proto = select_run_dirs(args.log_root, PROTO_ORDER, args.run_id)
+    total_runs = sum(len(v) for v in run_dirs_by_proto.values())
+    if total_runs == 0:
+        logging.error(
+            "No run directories selected under %s for protocols: %s",
+            args.log_root,
+            ", ".join(PROTO_ORDER),
+        )
+        return
+
+    for proto in PROTO_ORDER:
+        runs = run_dirs_by_proto.get(proto, [])
+        if runs:
+            logging.info(
+                "Using %d run(s) for %s: %s",
+                len(runs),
+                proto,
+                ", ".join(d.name for d in runs),
+            )
+        else:
+            logging.warning("No runs selected for %s", proto)
+
+    data = collect_all_data(args.log_root, PROTO_ORDER, run_dirs_by_proto)
     elephant_df = data["elephant"]
     mouse_df = data["mouse"]
     link_df = data["link"]
@@ -417,6 +530,11 @@ def main() -> None:
     plot_fct_cdf(
         mouse_df,
         output_dir / "whitebox_fct_cdf.png",
+        PROTO_ORDER,
+    )
+    plot_fct_histogram(
+        mouse_df,
+        output_dir / "whitebox_fct_hist.png",
         PROTO_ORDER,
     )
     plot_link_heatmap(

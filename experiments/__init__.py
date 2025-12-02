@@ -90,12 +90,7 @@ def picoquic_perf_cmd(
     extra_args is appended as-is when non-empty, allowing callers to inject
     additional picoquicdemo flags.
     """
-    parts = ["picoquicdemo", "-a", "perf", "-F", shlex.quote(str(csv_path))]
-    parts.extend([shlex.quote(str(server_ip)), str(server_port)])
-    if scenario:
-        parts.append(shlex.quote(str(scenario)))
-    elif duration is not None:
-        parts.extend(["-t", str(duration)])
+    parts = ["picoquicdemo", "-a", "perf"]
     if extra_args:
         # Preserve historical behavior if a string is passed; otherwise expand the iterable.
         if isinstance(extra_args, str):
@@ -103,4 +98,10 @@ def picoquic_perf_cmd(
         else:
             extras = [str(arg) for arg in extra_args if str(arg)]
         parts.extend(extras)
+    parts.extend(["-F", shlex.quote(str(csv_path))])
+    if duration is not None and scenario is None:
+        parts.extend(["-t", str(duration)])
+    parts.extend([shlex.quote(str(server_ip)), str(server_port)])
+    if scenario:
+        parts.append(shlex.quote(str(scenario)))
     return " ".join(parts)

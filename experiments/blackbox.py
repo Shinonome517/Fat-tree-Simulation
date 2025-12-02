@@ -21,6 +21,8 @@ from experiments import (
 )
 from topology import stop_fattree_topology
 
+DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario
+
 # Experiment parameters.
 ELEPHANT_PAIR_COUNT = 4
 MOUSE_PAIR_COUNT = 20
@@ -165,6 +167,70 @@ def _elephant_server_extra(proto: str) -> List[str]:
     return []
 
 
+def _healthcheck(
+    label: str,
+    proto: str,
+    server_host,
+    client_host,
+    server_ip: str,
+    port: int,
+    log_dir: Path,
+    run_tag: str = "",
+) -> None:
+    """
+    Lightweight pre-flight: ensure server process exists, ping works, and a short perf
+    session completes using the same extra args as the real run.
+    """
+    log_path = log_dir / f"healthcheck_{label}.log"
+    lines: List[str] = []
+    prefix = f"{run_tag} " if run_tag else ""
+
+    def _log(msg: str) -> None:
+        print(f"{prefix}{msg}")
+        lines.append(msg)
+
+    # Server presence
+    procs = server_host.cmd("pgrep -a picoquicdemo")
+    procs_clean = procs.strip()
+    server_ok = bool(procs_clean)
+    _log(f"[health:{label}] server procs: {procs_clean or 'none'}")
+
+    # Ping reachability
+    ping_out = client_host.cmd(f"ping -c1 -W1 {server_ip}; echo HC_RC=$?")
+    ping_ok = "HC_RC=0" in ping_out
+    _log(f"[health:{label}] ping ->\n{ping_out.strip()}")
+
+    # QUIC perf short run with correct extra args
+    client_extra = _elephant_client_extra(proto) if label == "elephant" else [a for a in EXTRA_ARGS_MOUSE.split() if a]
+    extra_str = _format_extra_args(client_extra)
+    hc_timeout = 10
+    scenario = DEFAULT_SCENARIO
+    hc_cmd = (
+        f"timeout {hc_timeout} "
+        f"picoquicdemo -a perf {extra_str} -F /tmp/blackbox_hc_{label}.csv "
+        f"{server_ip} {port} {shlex.quote(scenario)}"
+    )
+    hc_out = client_host.cmd(f"{hc_cmd}; echo HC_RC=$?")
+    _log(f"[health:{label}] quic (scenario={scenario}, extra_args={extra_str or 'none'}) ->\n{hc_out.strip()}")
+
+    hc_exit_code = None
+    for line in hc_out.splitlines():
+        if "Client exit with code" in line:
+            try:
+                hc_exit_code = int(line.rsplit("=", 1)[-1].strip())
+            except Exception:
+                pass
+    quic_ok = "HC_RC=0" in hc_out and hc_exit_code == 0
+
+    log_path.write_text("\n".join(lines) + "\n")
+
+    if not (server_ok and ping_ok and quic_ok):
+        raise RuntimeError(
+            f"healthcheck {label} failed (server_ok={server_ok}, ping_ok={ping_ok}, quic_ok={quic_ok}); "
+            f"see {log_path}"
+        )
+
+
 def run_blackbox_once(
     proto: str,
     k: int,
@@ -235,6 +301,33 @@ def run_blackbox_once(
 
         start_time = time.time()
         elephant_extra = _elephant_client_extra(proto)
+
+        # Pre-flight health checks on one elephant pair and one mouse pair (if present)
+        if elephant_pairs:
+            src, dst = elephant_pairs[0]
+            _healthcheck(
+                label="elephant",
+                proto=proto,
+                server_host=dst,
+                client_host=src,
+                server_ip=dst.IP(),
+                port=ELEPHANT_PORT,
+                log_dir=log_dir,
+                run_tag=run_tag,
+            )
+        if mouse_pairs:
+            src, dst = mouse_pairs[0]
+            _healthcheck(
+                label="mouse",
+                proto=proto,
+                server_host=dst,
+                client_host=src,
+                server_ip=dst.IP(),
+                port=MOUSE_PORT,
+                log_dir=log_dir,
+                run_tag=run_tag,
+            )
+
         print(f"{run_tag} starting elephant clients.")
         for idx, (src, dst) in enumerate(elephant_pairs):
             dst_ip = dst.IP()  # Use the primary/representative IP; current experiments do not require alternate addresses.

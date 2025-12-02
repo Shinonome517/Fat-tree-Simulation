@@ -336,6 +336,7 @@ def _healthcheck(
     log_dir: Path,
     label: str,
     run_tag: str = "",
+    proto: str = "",
 ) -> None:
     """
     Quick pre-flight to validate server process, IP reachability, and QUIC handshake.
@@ -363,12 +364,14 @@ def _healthcheck(
     # 3) QUIC handshake (timeout guards against hanging)
     hc_timeout = 10  # generous to allow small perf exchange to complete
     scenario = DEFAULT_SCENARIO  # minimal bidir traffic to force a quick exit
+    client_extra = get_extra_args(proto, ROLE_ELEPHANT_CLIENT if label == "elephant" else ROLE_MOUSE_CLIENT)
+    extra_str = _format_extra_args(client_extra)
     hc_cmd = (
         f"timeout {hc_timeout} "
-        f"picoquicdemo -a perf {server_ip} {port} {shlex.quote(scenario)}"
+        f"picoquicdemo -a perf {extra_str} {server_ip} {port} {shlex.quote(scenario)}"
     )
     hc_out = client_host.cmd(f"{hc_cmd}; echo HC_RC=$?")
-    _log(f"[health:{label}] quic (scenario={scenario}) ->\n{hc_out.strip()}")
+    _log(f"[health:{label}] quic (scenario={scenario}, extra_args={extra_str or 'none'}) ->\n{hc_out.strip()}")
 
     hc_exit_match = re.search(r"Client exit with code\s*=\s*(-?\d+)", hc_out)
     client_exit_code = int(hc_exit_match.group(1)) if hc_exit_match else None
@@ -466,6 +469,7 @@ def run_whitebox_once(
             log_dir=log_dir,
             label="elephant",
             run_tag=run_tag,
+            proto=proto,
         )
         _healthcheck(
             server_host=server_host,
@@ -475,6 +479,7 @@ def run_whitebox_once(
             log_dir=log_dir,
             label="mouse",
             run_tag=run_tag,
+            proto=proto,
         )
         print(f"{run_tag} health checks passed.")
 
