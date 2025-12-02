@@ -121,18 +121,19 @@ def load_elephant_goodput(csv_path: Path) -> List[float]:
         return []
 
     df = _normalize_columns(df)
-    if "Duration" not in df or "Received" not in df:
+    if "Duration" not in df or "Sent" not in df:
         logging.warning("Required columns missing in %s", csv_path)
         return []
 
     durations = pd.to_numeric(df["Duration"], errors="coerce")
-    received = pd.to_numeric(df["Received"], errors="coerce")
-    valid = durations.notna() & received.notna() & (durations > 0)
+    sent = pd.to_numeric(df["Sent"], errors="coerce")
+    valid = durations.notna() & sent.notna() & (durations > 0)
     if valid.sum() == 0:
         logging.warning("No valid rows in %s", csv_path)
         return []
 
-    goodput_mbps = (received[valid] * 8 / durations[valid]) / 1e6
+    # Goodput is based on client transmit direction: Sent bytes over Duration.
+    goodput_mbps = (sent[valid] * 8 / durations[valid]) / 1e6
     return goodput_mbps.tolist()
 
 

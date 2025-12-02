@@ -11,7 +11,7 @@ import shlex
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple, Union
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 from experiments import (
     create_fattree,
@@ -22,6 +22,8 @@ from experiments import (
 from topology import stop_fattree_topology
 
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario
+DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
+DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
 
 # Experiment parameters.
 ELEPHANT_PAIR_COUNT = 4
@@ -38,10 +40,10 @@ DEFAULT_SEED = 12345
 PICOQUIC_CERT_PATH = "/etc/picoquic/server-cert.pem"
 PICOQUIC_KEY_PATH = "/etc/picoquic/server-key.pem"
 ELEPHANT_SERVER_CMD_TEMPLATE = (
-    "picoquicdemo -a server -p {port} -c {cert} -k {key} {extra} > {log_path} 2>&1"
+    "picoquicdemo -a server -p {port} -l {qlog_path} -c {cert} -k {key} {extra} > {log_path} 2>&1"
 )
 MOUSE_SERVER_CMD_TEMPLATE = (
-    "picoquicdemo -a server -p {port} -c {cert} -k {key} {extra} > {log_path} 2>&1"
+    "picoquicdemo -a server -p {port} -l {qlog_path} -c {cert} -k {key} {extra} > {log_path} 2>&1"
 )
 
 # Extra args for picoquicdemo perf mode.
@@ -62,9 +64,11 @@ def _format_extra_args(extra_args: Union[Iterable[str], str, None]) -> str:
 
 
 def _start_picoquic_server(host, port: int, log_path: Path, template: str, extra_args) -> object:
+    qlog_path = Path(f"{log_path}.qlog")
     cmd = template.format(
         port=port,
         log_path=shlex.quote(str(log_path)),
+        qlog_path=shlex.quote(str(qlog_path)),
         extra=_format_extra_args(extra_args),
         cert=PICOQUIC_CERT_PATH,
         key=PICOQUIC_KEY_PATH,
@@ -237,6 +241,8 @@ def run_blackbox_once(
     duration: float,
     base_seed: int,
     run_index: int,
+    elephant_bytes: Optional[int],
+    elephant_load_fraction: float,
 ) -> None:
     """Execute one blackbox experiment run."""
     seed = base_seed + run_index
@@ -256,7 +262,7 @@ def run_blackbox_once(
     mouse_stop = threading.Event()
 
     try:
-        ctx = create_fattree(k=k, bw_mbps=1000, delay="0.05ms", queue_pkts=75)
+        ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=75)
         hosts_flat = [h for pod in ctx.hosts for edge in pod for h in edge]
         print(f"{run_tag} hosts ready: {len(hosts_flat)} total.")
 
@@ -297,10 +303,17 @@ def run_blackbox_once(
                     MOUSE_SERVER_CMD_TEMPLATE,
                     [],
                 )
-            )
+        )
 
         start_time = time.time()
         elephant_extra = _elephant_client_extra(proto)
+        elephant_target_bytes = elephant_bytes
+        if elephant_target_bytes is None:
+            link_bps = DEFAULT_LINK_BW_MBPS * 1_000_000
+            elephant_target_bytes = int(elephant_load_fraction * link_bps / 8 * duration)
+        if elephant_target_bytes <= 0:
+            raise ValueError("elephant_bytes must be positive when provided or computed.")
+        elephant_scenario = f"*1:{elephant_target_bytes}:0;"
 
         # Pre-flight health checks on one elephant pair and one mouse pair (if present)
         if elephant_pairs:
@@ -332,12 +345,14 @@ def run_blackbox_once(
         for idx, (src, dst) in enumerate(elephant_pairs):
             dst_ip = dst.IP()  # Use the primary/representative IP; current experiments do not require alternate addresses.
             csv_path = log_dir / f"elephant_{idx:02d}.csv"
+            print(
+                f"{run_tag} elephant {idx:02d}: payload_bytes={elephant_target_bytes}, dst={dst_ip}"
+            )
             elephant_cmd = picoquic_perf_cmd(
                 server_ip=dst_ip,
                 server_port=ELEPHANT_PORT,
                 csv_path=csv_path,
-                scenario=None,
-                duration=duration,
+                scenario=elephant_scenario,
                 extra_args=elephant_extra,
             )
             proc = src.popen(elephant_cmd, shell=True)
@@ -408,6 +423,18 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=4)
     parser.add_argument("--duration", type=float, default=300.0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--elephant-bytes",
+        type=int,
+        default=None,
+        help="Total payload bytes per Elephant perf scenario; overrides auto-sizing.",
+    )
+    parser.add_argument(
+        "--elephant-load-frac",
+        type=float,
+        default=DEFAULT_ELEPHANT_LOAD_FRAC,
+        help="If --elephant-bytes is unset, fraction of link capacity to target per Elephant flow (default 0.7).",
+    )
     args = parser.parse_args()
 
     for run_idx in range(args.runs):
@@ -417,6 +444,8 @@ def main() -> None:
             duration=args.duration,
             base_seed=args.seed,
             run_index=run_idx,
+            elephant_bytes=args.elephant_bytes,
+            elephant_load_fraction=args.elephant_load_frac,
         )
 
 

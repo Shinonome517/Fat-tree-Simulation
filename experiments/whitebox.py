@@ -34,15 +34,17 @@ ELEPHANT_PORT = 4443
 MOUSE_PORT = 4444
 DEFAULT_SEED = 12345
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario (1 stream, 1KB each way)
+DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
+DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
 
 # TODO: Adjust server options (certs/logging/paths) for actual experiments.
 PICOQUIC_CERT_PATH = "/etc/picoquic/server-cert.pem"
 PICOQUIC_KEY_PATH = "/etc/picoquic/server-key.pem"
 ELEPHANT_SERVER_CMD_TEMPLATE = (
-    "picoquicdemo -a server -p {port} -c {cert} -k {key} {extra} > {log_path} 2>&1"
+    "picoquicdemo -a server -p {port} -l {qlog_path} -c {cert} -k {key} {extra} > {log_path} 2>&1"
 )
 MOUSE_SERVER_CMD_TEMPLATE = (
-    "picoquicdemo -a server -p {port} -c {cert} -k {key} {extra} > {log_path} 2>&1"
+    "picoquicdemo -a server -p {port} -l {qlog_path} -c {cert} -k {key} {extra} > {log_path} 2>&1"
 )
 
 # Roles for picoquic extra-arg selection.
@@ -255,9 +257,11 @@ def _format_extra_args(args: List[str]) -> str:
 
 
 def _start_picoquic_server(host, port: int, log_path: Path, template: str, extra_args: List[str]):
+    qlog_path = Path(f"{log_path}.qlog")
     cmd = template.format(
         port=port,
         log_path=shlex.quote(str(log_path)),
+        qlog_path=shlex.quote(str(qlog_path)),
         extra=_format_extra_args(extra_args),
         cert=PICOQUIC_CERT_PATH,
         key=PICOQUIC_KEY_PATH,
@@ -392,6 +396,8 @@ def run_whitebox_once(
     duration: float,
     base_seed: int,
     run_index: int,
+    elephant_bytes: Optional[int],
+    elephant_load_fraction: float,
     total_runs: Optional[int] = None,
 ) -> None:
     """Execute one whitebox experiment run."""
@@ -416,7 +422,7 @@ def run_whitebox_once(
     server_procs: List = []
 
     try:
-        ctx = create_fattree(k=k, bw_mbps=1000, delay="0.05ms", queue_pkts=75)
+        ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=75)
         print(f"{run_tag} topology ready.")
 
         elephant_client = ctx.net.get("h001")
@@ -484,15 +490,25 @@ def run_whitebox_once(
         print(f"{run_tag} health checks passed.")
 
         total_duration = WARMUP_SECONDS + duration
+        elephant_target_bytes = elephant_bytes
+        if elephant_target_bytes is None:
+            link_bps = DEFAULT_LINK_BW_MBPS * 1_000_000
+            elephant_target_bytes = int(elephant_load_fraction * link_bps / 8 * total_duration)
+        if elephant_target_bytes <= 0:
+            raise ValueError("elephant_bytes must be positive when provided or computed.")
+        elephant_scenario = f"*1:{elephant_target_bytes}:0;"
 
         elephant_csv = log_dir / "elephant_client.csv"
         elephant_extra = get_extra_args(proto, ROLE_ELEPHANT_CLIENT)
-        print(f"{run_tag} starting elephant client (duration={total_duration}s).")
+        print(
+            f"{run_tag} starting elephant client "
+            f"(duration={total_duration}s, payload_bytes={elephant_target_bytes})."
+        )
         elephant_cmd = picoquic_perf_cmd(
             server_ip=server_ip,
             server_port=ELEPHANT_PORT,
             csv_path=elephant_csv,
-            scenario=DEFAULT_SCENARIO,
+            scenario=elephant_scenario,
             extra_args=elephant_extra,
         )
         elephant_client_proc = elephant_client.popen(elephant_cmd, shell=True)
@@ -549,6 +565,18 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=4)
     parser.add_argument("--duration", type=float, default=60.0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--elephant-bytes",
+        type=int,
+        default=None,
+        help="Total payload bytes for the Elephant perf scenario; overrides auto-sizing.",
+    )
+    parser.add_argument(
+        "--elephant-load-frac",
+        type=float,
+        default=DEFAULT_ELEPHANT_LOAD_FRAC,
+        help="If --elephant-bytes is unset, fraction of link capacity to target (default 0.7).",
+    )
     args = parser.parse_args()
 
     for run_idx in range(args.runs):
@@ -558,6 +586,8 @@ def main() -> None:
             duration=args.duration,
             base_seed=args.seed,
             run_index=run_idx,
+            elephant_bytes=args.elephant_bytes,
+            elephant_load_fraction=args.elephant_load_frac,
             total_runs=args.runs,
         )
 
