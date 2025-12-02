@@ -215,3 +215,4 @@ memo.md
 logs/
 analysis/plots/
 analysis_test/
+*.bin

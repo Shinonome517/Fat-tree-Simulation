@@ -8,6 +8,7 @@ will be implemented in Step 4.
 import argparse
 import json
 import random
+import re
 import shlex
 import threading
 import time
@@ -32,6 +33,7 @@ WARMUP_SECONDS = 5
 ELEPHANT_PORT = 4443
 MOUSE_PORT = 4444
 DEFAULT_SEED = 12345
+DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario (1 stream, 1KB each way)
 
 # TODO: Adjust server options (certs/logging/paths) for actual experiments.
 PICOQUIC_CERT_PATH = "/etc/picoquic/server-cert.pem"
@@ -319,11 +321,66 @@ def _run_mouse_flows(
             server_ip=server_ip,
             server_port=MOUSE_PORT,
             csv_path=csv_path,
-            duration=1.0,
+            scenario=DEFAULT_SCENARIO,
             extra_args=extra_args,
         )
         proc = host.popen(mouse_cmd, shell=True)
         proc_store.append(proc)
+
+
+def _healthcheck(
+    server_host,
+    client_host,
+    server_ip: str,
+    port: int,
+    log_dir: Path,
+    label: str,
+    run_tag: str = "",
+) -> None:
+    """
+    Quick pre-flight to validate server process, IP reachability, and QUIC handshake.
+    Raises RuntimeError on failure so the main run aborts before starting traffic.
+    """
+    prefix = f"{run_tag} " if run_tag else ""
+    log_path = log_dir / f"healthcheck_{label}.log"
+    lines: List[str] = []
+
+    def _log(msg: str) -> None:
+        print(f"{prefix}{msg}")
+        lines.append(msg)
+
+    # 1) Server process presence
+    procs = server_host.cmd("pgrep -a picoquicdemo")
+    procs_clean = procs.strip()
+    _log(f"[health:{label}] server procs: {procs_clean or 'none'}")
+    server_ok = bool(procs_clean)
+
+    # 2) IP reachability
+    ping_out = client_host.cmd(f"ping -c1 -W1 {server_ip}; echo HC_RC=$?")
+    _log(f"[health:{label}] ping ->\n{ping_out.strip()}")
+    ping_ok = "HC_RC=0" in ping_out
+
+    # 3) QUIC handshake (timeout guards against hanging)
+    hc_timeout = 10  # generous to allow small perf exchange to complete
+    scenario = DEFAULT_SCENARIO  # minimal bidir traffic to force a quick exit
+    hc_cmd = (
+        f"timeout {hc_timeout} "
+        f"picoquicdemo -a perf {server_ip} {port} {shlex.quote(scenario)}"
+    )
+    hc_out = client_host.cmd(f"{hc_cmd}; echo HC_RC=$?")
+    _log(f"[health:{label}] quic (scenario={scenario}) ->\n{hc_out.strip()}")
+
+    hc_exit_match = re.search(r"Client exit with code\s*=\s*(-?\d+)", hc_out)
+    client_exit_code = int(hc_exit_match.group(1)) if hc_exit_match else None
+    quic_ok = "HC_RC=0" in hc_out and client_exit_code == 0
+
+    log_path.write_text("\n".join(lines) + "\n")
+
+    if not (server_ok and ping_ok and quic_ok):
+        raise RuntimeError(
+            f"healthcheck {label} failed (server_ok={server_ok}, ping_ok={ping_ok}, quic_ok={quic_ok}); "
+            f"see {log_path}"
+        )
 
 
 def run_whitebox_once(
@@ -398,6 +455,29 @@ def run_whitebox_once(
         print(f"{run_tag} policy routing configured.")
 
         server_ip = server_host.IP()
+
+        # Pre-flight health checks (abort if connectivity/handshake fails).
+        print(f"{run_tag} running health checks...")
+        _healthcheck(
+            server_host=server_host,
+            client_host=elephant_client,
+            server_ip=server_ip,
+            port=ELEPHANT_PORT,
+            log_dir=log_dir,
+            label="elephant",
+            run_tag=run_tag,
+        )
+        _healthcheck(
+            server_host=server_host,
+            client_host=mouse_client,
+            server_ip=server_ip,
+            port=MOUSE_PORT,
+            log_dir=log_dir,
+            label="mouse",
+            run_tag=run_tag,
+        )
+        print(f"{run_tag} health checks passed.")
+
         total_duration = WARMUP_SECONDS + duration
 
         elephant_csv = log_dir / "elephant_client.csv"
@@ -407,7 +487,7 @@ def run_whitebox_once(
             server_ip=server_ip,
             server_port=ELEPHANT_PORT,
             csv_path=elephant_csv,
-            duration=total_duration,
+            scenario=DEFAULT_SCENARIO,
             extra_args=elephant_extra,
         )
         elephant_client_proc = elephant_client.popen(elephant_cmd, shell=True)
