@@ -36,15 +36,17 @@ DEFAULT_SEED = 12345
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario (1 stream, 1KB each way)
 DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
 DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
+MOUSE_SIZE_MIN = 4 * 1024
+MOUSE_SIZE_MAX = 64 * 1024
 
 # TODO: Adjust server options (certs/logging/paths) for actual experiments.
 PICOQUIC_CERT_PATH = "/etc/picoquic/server-cert.pem"
 PICOQUIC_KEY_PATH = "/etc/picoquic/server-key.pem"
 ELEPHANT_SERVER_CMD_TEMPLATE = (
-    "picoquicdemo -a server -p {port} -l {qlog_path} -c {cert} -k {key} {extra} > {log_path} 2>&1"
+    "picoquicdemo -a server -p {port} {qlog_flag} -c {cert} -k {key} {extra} > {log_path} 2>&1"
 )
 MOUSE_SERVER_CMD_TEMPLATE = (
-    "picoquicdemo -a server -p {port} -l {qlog_path} -c {cert} -k {key} {extra} > {log_path} 2>&1"
+    "picoquicdemo -a server -p {port} {qlog_flag} -c {cert} -k {key} {extra} > {log_path} 2>&1"
 )
 
 # Roles for picoquic extra-arg selection.
@@ -256,12 +258,17 @@ def _format_extra_args(args: List[str]) -> str:
     return " ".join(shlex.quote(str(a)) for a in args if a)
 
 
-def _start_picoquic_server(host, port: int, log_path: Path, template: str, extra_args: List[str]):
-    qlog_path = Path(f"{log_path}.qlog")
+def _start_picoquic_server(
+    host, port: int, log_path: Path, template: str, extra_args: List[str], enable_qlog: bool
+):
+    qlog_flag = ""
+    if enable_qlog:
+        qlog_path = Path(f"{log_path}.qlog")
+        qlog_flag = f"-l {shlex.quote(str(qlog_path))}"
     cmd = template.format(
         port=port,
         log_path=shlex.quote(str(log_path)),
-        qlog_path=shlex.quote(str(qlog_path)),
+        qlog_flag=qlog_flag,
         extra=_format_extra_args(extra_args),
         cert=PICOQUIC_CERT_PATH,
         key=PICOQUIC_KEY_PATH,
@@ -321,11 +328,13 @@ def _run_mouse_flows(
 
         seq += 1
         csv_path = log_dir / f"mouse_client_{seq:04d}.csv"
+        size_bytes = random.randint(MOUSE_SIZE_MIN, MOUSE_SIZE_MAX)
+        scenario = f"*1:{size_bytes}:0;"
         mouse_cmd = picoquic_perf_cmd(
             server_ip=server_ip,
             server_port=MOUSE_PORT,
             csv_path=csv_path,
-            scenario=DEFAULT_SCENARIO,
+            scenario=scenario,
             extra_args=extra_args,
         )
         proc = host.popen(mouse_cmd, shell=True)
@@ -399,6 +408,7 @@ def run_whitebox_once(
     elephant_bytes: Optional[int],
     elephant_load_fraction: float,
     total_runs: Optional[int] = None,
+    enable_qlog: bool = False,
 ) -> None:
     """Execute one whitebox experiment run."""
     seed = base_seed + run_index
@@ -448,6 +458,7 @@ def run_whitebox_once(
                 elephant_server_log,
                 ELEPHANT_SERVER_CMD_TEMPLATE,
                 elephant_server_args,
+                enable_qlog,
             )
         )
         server_procs.append(
@@ -457,6 +468,7 @@ def run_whitebox_once(
                 mouse_server_log,
                 MOUSE_SERVER_CMD_TEMPLATE,
                 mouse_server_args,
+                enable_qlog,
             )
         )
 
@@ -577,6 +589,11 @@ def main() -> None:
         default=DEFAULT_ELEPHANT_LOAD_FRAC,
         help="If --elephant-bytes is unset, fraction of link capacity to target (default 0.7).",
     )
+    parser.add_argument(
+        "--enable-qlog",
+        action="store_true",
+        help="Enable picoquicdemo -l qlog capture for servers (default: disabled for performance).",
+    )
     args = parser.parse_args()
 
     for run_idx in range(args.runs):
@@ -589,6 +606,7 @@ def main() -> None:
             elephant_bytes=args.elephant_bytes,
             elephant_load_fraction=args.elephant_load_frac,
             total_runs=args.runs,
+            enable_qlog=args.enable_qlog,
         )
 
 
