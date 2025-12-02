@@ -213,4 +213,5 @@ context.txt
 context.md
 memo.md
 logs/
+analysis/plots/
 analysis_test/
