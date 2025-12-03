@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # 解析用の Python ライブラリ
-RUN python3 -m pip install --no-cache-dir numpy pandas matplotlib
+RUN python3 -m pip install --no-cache-dir numpy pandas matplotlib networkx
 
 # OVS/Mininet 用の sysctl（実行時に適用）
 RUN printf 'net.ipv4.ip_forward=1\nnet.core.rmem_max=268435456\nnet.core.wmem_max=268435456\n' \

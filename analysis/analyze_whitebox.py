@@ -22,6 +22,8 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+from fattree_heatmap import plot_fattree_heatmap
+
 
 DEFAULT_LOG_ROOT = Path("./logs/whitebox")
 DEFAULT_OUTPUT_DIR = Path("./analysis/plots")
@@ -56,6 +58,18 @@ def parse_args() -> argparse.Namespace:
             "Can be specified multiple times. "
             "Default: use the latest run_* per protocol."
         ),
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=4,
+        help="Fat-tree k parameter used to build the graph layout (default: 4).",
+    )
+    parser.add_argument(
+        "--heatmap-mode",
+        choices=["graph", "pivot"],
+        default="graph",
+        help="Heatmap style: 'graph' overlays on fat-tree, 'pivot' keeps the original matrix view.",
     )
     return parser.parse_args()
 
@@ -591,11 +605,20 @@ def main() -> None:
         output_dir / "whitebox_fct_hist.png",
         PROTO_ORDER,
     )
-    plot_link_heatmap(
-        link_df,
-        output_dir / "whitebox_link_heatmap.png",
-        PROTO_ORDER,
-    )
+
+    if args.heatmap_mode == "pivot":
+        plot_link_heatmap(
+            link_df,
+            output_dir / "whitebox_link_heatmap.png",
+            PROTO_ORDER,
+        )
+    else:
+        plot_fattree_heatmap(
+            link_df,
+            output_dir / "whitebox_link_heatmap.png",
+            PROTO_ORDER,
+            k=args.k,
+        )
 
     write_summary(
         output_dir / "whitebox_summary.txt",
