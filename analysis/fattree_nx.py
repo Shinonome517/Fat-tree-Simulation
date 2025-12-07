@@ -2,7 +2,16 @@
 NetworkX helpers for building and laying out Fat-Tree topologies.
 """
 
+import sys
+from pathlib import Path
+
 import networkx as nx
+
+
+# Ensure the repo root is on sys.path so direct script execution works.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from topology import _fattree_dims
 

@@ -46,6 +46,14 @@ def parse_args() -> argparse.Namespace:
         help="Directory to write plots and summary text.",
     )
     parser.add_argument(
+        "--output-subdir",
+        type=Path,
+        help=(
+            "Optional subdirectory name; outputs go to <output-dir>/black/<name>. "
+            "Default subdir: default."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging.",
@@ -327,27 +335,31 @@ def _plot_cdf(ax, values: np.ndarray, label: str):
     return line
 
 
-def plot_elephant_goodput_cdf(
+def plot_elephant_goodput_bar(
     elephant_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
 ) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
-    has_data = False
+    means: List[float] = []
+    stds: List[float] = []
+    labels: List[str] = []
     for proto in protos:
         subset = elephant_df[elephant_df["proto"] == proto]
         if subset.empty:
             logging.warning("No elephant goodput data for %s", proto)
             continue
-        values = subset["goodput_mbps"].to_numpy()
-        _plot_cdf(ax, values, proto)
-        has_data = True
+        labels.append(proto)
+        means.append(subset["goodput_mbps"].mean())
+        stds.append(subset["goodput_mbps"].std(ddof=0))
 
-    if not has_data:
+    if not means:
         ax.text(0.5, 0.5, "No elephant data", ha="center", va="center")
     else:
-        ax.set_xlabel("Elephant goodput (Mbps)")
-        ax.set_ylabel("CDF")
-        ax.set_title("Elephant Goodput CDF")
-        ax.grid(True, linestyle="--", alpha=0.4)
+        x = np.arange(len(labels))
+        ax.bar(x, means, yerr=stds, capsize=8, alpha=0.8, label="mean +/- SD")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.set_ylabel("Goodput (Mbps)")
+        ax.set_title("Elephant Goodput (error bars = SD)")
         ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
@@ -457,6 +469,7 @@ def write_summary(
         p99 = np.percentile(subset["goodput_mbps"], 99)
         lines.append(
             f"- {proto}: mean={subset['goodput_mbps'].mean():.3f}, "
+            f"std={subset['goodput_mbps'].std(ddof=0):.3f}, "
             f"median={p50:.3f}, p90={p90:.3f}, p99={p99:.3f}, "
             f"samples={len(subset)}"
         )
@@ -496,8 +509,10 @@ def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
 
-    output_dir: Path = args.output_dir
+    output_subdir = args.output_subdir or Path("default")
+    output_dir: Path = args.output_dir / "black" / output_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
+    logging.info("Writing outputs to %s", output_dir)
 
     run_dirs_by_proto = select_run_dirs(args.log_root, PROTO_ORDER, args.run_id)
     total_runs = sum(len(v) for v in run_dirs_by_proto.values())
@@ -532,9 +547,9 @@ def main() -> None:
 
     fairness_df = compute_fairness(link_df)
 
-    plot_elephant_goodput_cdf(
+    plot_elephant_goodput_bar(
         elephant_df,
-        output_dir / "blackbox_elephant_goodput_cdf.png",
+        output_dir / "blackbox_elephant_goodput_bar.png",
         PROTO_ORDER,
     )
     plot_mouse_fct_cdf(

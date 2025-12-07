@@ -46,6 +46,14 @@ def parse_args() -> argparse.Namespace:
         help="Directory to write plots and summary text.",
     )
     parser.add_argument(
+        "--output-subdir",
+        type=Path,
+        help=(
+            "Optional subdirectory name; outputs go to <output-dir>/white/<name>. "
+            "Default subdir: default."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging.",
@@ -196,9 +204,7 @@ def load_switch_tx_deltas(
 
     deltas: Dict[str, float] = {}
     for if_name in set(before.keys()) | set(after.keys()):
-        delta = _extract_tx_bytes(after.get(if_name, {})) - _extract_tx_bytes(
-            before.get(if_name, {})
-        )
+        delta = _extract_tx_bytes(after.get(if_name, {})) - _extract_tx_bytes(before.get(if_name, {}))
         deltas[if_name] = float(delta)
     # TODO: Narrow to uplinks only if interface naming allows reliable detection.
     return deltas
@@ -320,11 +326,12 @@ def plot_goodput_bar(
         ax.text(0.5, 0.5, "No elephant data", ha="center", va="center")
     else:
         x = np.arange(len(labels))
-        ax.bar(x, means, yerr=stds, capsize=8, alpha=0.8)
+        ax.bar(x, means, yerr=stds, capsize=8, alpha=0.8, label="mean +/- SD")
         ax.set_xticks(x)
         ax.set_xticklabels(labels)
         ax.set_ylabel("Goodput (Mbps)")
-        ax.set_title("Elephant Goodput")
+        ax.set_title("Elephant Goodput (error bars = SD)")
+        ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
@@ -554,8 +561,10 @@ def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
 
-    output_dir: Path = args.output_dir
+    output_subdir = args.output_subdir or Path("default")
+    output_dir: Path = args.output_dir / "white" / output_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
+    logging.info("Writing outputs to %s", output_dir)
 
     run_dirs_by_proto = select_run_dirs(args.log_root, PROTO_ORDER, args.run_id)
     total_runs = sum(len(v) for v in run_dirs_by_proto.values())
