@@ -29,6 +29,8 @@ DEFAULT_LOG_ROOT = Path("./logs/whitebox")
 DEFAULT_OUTPUT_DIR = Path("./analysis/plots")
 PROTO_ORDER = ("quic", "mpquic")
 HEATMAP_MAX_IFACES = 20  # Limit for readability; trim if there are many ifaces.
+MOUSE_DROPLOSS_FILENAME = "whitebox_mouse_droploss_ratio.png"
+MOUSE_RETRANS_FILENAME = "whitebox_mouse_retrans_ratio.png"
 
 
 def parse_args() -> argparse.Namespace:
@@ -588,6 +590,12 @@ def main() -> None:
         else:
             logging.warning("No runs selected for %s", proto)
 
+    run_list: List[Tuple[str, Path]] = [
+        (f"{proto}:{run_dir.name}", run_dir)
+        for proto in PROTO_ORDER
+        for run_dir in run_dirs_by_proto.get(proto, [])
+    ]
+
     data = collect_all_data(args.log_root, PROTO_ORDER, run_dirs_by_proto)
     elephant_df = data["elephant"]
     mouse_df = data["mouse"]
@@ -636,6 +644,89 @@ def main() -> None:
         fairness_df,
         PROTO_ORDER,
     )
+
+    if not run_list:
+        logging.warning("No runs available; skipping mouse drop/retrans plots.")
+    else:
+        import analysis.mouse_droploss_plot as droploss
+        import analysis.mouse_retrans_plot as retrans
+
+        # Drop-induced retrans (per proto, aggregated across selected runs)
+        droploss_summaries: List[droploss.DropLossSummary] = []
+        for proto in PROTO_ORDER:
+            runs = run_dirs_by_proto.get(proto, [])
+            if not runs:
+                continue
+            drop_total = 0
+            total_flows = 0
+            for run_dir in runs:
+                summary = droploss.summarize_run(run_dir, label=proto)
+                drop_total += summary.drop_flows
+                total_flows += summary.total_flows
+            droploss_summaries.append(
+                droploss.DropLossSummary(
+                    label=proto,
+                    run_dir=runs[-1],
+                    drop_flows=drop_total,
+                    total_flows=total_flows,
+                )
+            )
+        if droploss_summaries:
+            droploss_path = droploss.plot_drop_retrans_ratios(
+                droploss_summaries,
+                output_dir=output_dir,
+                filename=MOUSE_DROPLOSS_FILENAME,
+                title="Mouse drop-induced retransmissions",
+            )
+            drop_flows = sum(s.drop_flows for s in droploss_summaries)
+            total_flows = sum(s.total_flows for s in droploss_summaries)
+            logging.info(
+                "Wrote drop-loss plot to %s (drop-induced retrans flows: %d/%d).",
+                droploss_path,
+                drop_flows,
+                total_flows,
+            )
+        else:
+            logging.warning("No runs available for drop-loss plot.")
+
+        # Any retrans (per proto, aggregated across selected runs)
+        retrans_summaries = []
+        for proto in PROTO_ORDER:
+            runs = run_dirs_by_proto.get(proto, [])
+            if not runs:
+                continue
+            retrans_total = 0
+            total_flows = 0
+            for run_dir in runs:
+                summary = retrans.summarize_run(run_dir, label=proto)
+                retrans_total += summary.retrans_flows
+                total_flows += summary.total_flows
+            retrans_summaries.append(
+                retrans.RetransSummary(
+                    label=proto,
+                    run_dir=runs[-1],
+                    retrans_flows=retrans_total,
+                    total_flows=total_flows,
+                )
+            )
+
+        if retrans_summaries:
+            retrans_path = retrans.plot_retrans_ratios(
+                retrans_summaries,
+                output_dir=output_dir,
+                filename=MOUSE_RETRANS_FILENAME,
+                title="Mouse retransmission ratio",
+            )
+            retrans_flows = sum(s.retrans_flows for s in retrans_summaries)
+            total_flows = sum(s.total_flows for s in retrans_summaries)
+            logging.info(
+                "Wrote retrans plot to %s (flows with retrans: %d/%d).",
+                retrans_path,
+                retrans_flows,
+                total_flows,
+            )
+        else:
+            logging.warning("No runs available for retrans plot.")
 
 
 if __name__ == "__main__":
