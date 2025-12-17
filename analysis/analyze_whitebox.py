@@ -25,8 +25,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 from fattree_heatmap import plot_fattree_heatmap
 
 
-DEFAULT_LOG_ROOT = Path("./logs/whitebox")
-DEFAULT_OUTPUT_DIR = Path("./analysis/plots")
+LOG_ROOT_BASE = Path("./logs/whitebox")
+DEFAULT_LOG_DIR_NAME = Path("default")
+OUTPUT_ROOT = Path("./analysis/plots/white")
 PROTO_ORDER = ("quic", "mpquic")
 HEATMAP_MAX_IFACES = 20  # Limit for readability; trim if there are many ifaces.
 MOUSE_DROPLOSS_FILENAME = "whitebox_mouse_droploss_ratio.png"
@@ -36,24 +37,18 @@ MOUSE_RETRANS_FILENAME = "whitebox_mouse_retrans_ratio.png"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze whitebox experiment logs.")
     parser.add_argument(
-        "--log-root",
+        "--log-dir",
+        dest="log_dir_name",
         type=Path,
-        default=DEFAULT_LOG_ROOT,
-        help="Root directory containing per-proto run_* subdirectories.",
+        default=DEFAULT_LOG_DIR_NAME,
+        help="Directory name under logs/whitebox to analyze (default: default).",
     )
     parser.add_argument(
         "--output-dir",
+        dest="output_dir_name",
         type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory to write plots and summary text.",
-    )
-    parser.add_argument(
-        "--output-subdir",
-        type=Path,
-        help=(
-            "Optional subdirectory name; outputs go to <output-dir>/white/<name>. "
-            "Default subdir: default."
-        ),
+        default=Path("default"),
+        help="Output subdirectory name under analysis/plots/white (default: default).",
     )
     parser.add_argument(
         "--verbose",
@@ -563,17 +558,18 @@ def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
 
-    output_subdir = args.output_subdir or Path("default")
-    output_dir: Path = args.output_dir / "white" / output_subdir
+    output_subdir = args.output_dir_name
+    output_dir: Path = OUTPUT_ROOT / output_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
     logging.info("Writing outputs to %s", output_dir)
 
-    run_dirs_by_proto = select_run_dirs(args.log_root, PROTO_ORDER, args.run_id)
+    log_root = LOG_ROOT_BASE / args.log_dir_name
+    run_dirs_by_proto = select_run_dirs(log_root, PROTO_ORDER, args.run_id)
     total_runs = sum(len(v) for v in run_dirs_by_proto.values())
     if total_runs == 0:
         logging.error(
             "No run directories selected under %s for protocols: %s",
-            args.log_root,
+            log_root,
             ", ".join(PROTO_ORDER),
         )
         return
@@ -596,13 +592,13 @@ def main() -> None:
         for run_dir in run_dirs_by_proto.get(proto, [])
     ]
 
-    data = collect_all_data(args.log_root, PROTO_ORDER, run_dirs_by_proto)
+    data = collect_all_data(log_root, PROTO_ORDER, run_dirs_by_proto)
     elephant_df = data["elephant"]
     mouse_df = data["mouse"]
     link_df = data["link"]
 
     if elephant_df.empty and mouse_df.empty and link_df.empty:
-        logging.error("No data found under %s", args.log_root)
+        logging.error("No data found under %s", log_root)
         return
 
     fairness_df = compute_fairness(link_df)

@@ -65,10 +65,15 @@ def snapshot_switch_bytes(ctx: FatTreeContext) -> Dict[str, Dict[str, int]]:
     return stats
 
 
-def make_log_dir(exp_kind: str, proto: str) -> Path:
+def make_log_dir(
+    exp_kind: str,
+    proto: str,
+    log_root: Optional[Path] = None,
+) -> Path:
     """Create and return a timestamped log directory for the given experiment."""
     ts = time.strftime("%Y%m%d-%H%M%S")
-    path = Path("logs") / exp_kind / proto / f"run_{ts}"
+    base = Path(log_root) if log_root is not None else Path("logs") / exp_kind
+    path = base / proto / f"run_{ts}"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
