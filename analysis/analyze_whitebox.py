@@ -303,6 +303,17 @@ def _plot_cdf(ax, values: np.ndarray, label: str):
     return line
 
 
+def _outlier_mask(values: np.ndarray) -> Tuple[np.ndarray, float, float]:
+    if values.size == 0:
+        return np.zeros(0, dtype=bool), float("nan"), float("nan")
+    q1, q3 = np.percentile(values, [25, 75])
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    mask = (values < lower) | (values > upper)
+    return mask, lower, upper
+
+
 def plot_goodput_bar(
     elephant_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
 ) -> None:
@@ -335,7 +346,12 @@ def plot_goodput_bar(
 
 
 def plot_fct_cdf(
-    mouse_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
+    mouse_df: pd.DataFrame,
+    output_path: Path,
+    protos: Sequence[str],
+    *,
+    exclude_outliers: bool = False,
+    mark_outliers: bool = False,
 ) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
     has_data = False
@@ -344,14 +360,17 @@ def plot_fct_cdf(
         if subset.empty:
             logging.warning("No mouse FCT data for %s", proto)
             continue
-        values = subset["fct_s"].to_numpy()
+        values_all = subset["fct_s"].to_numpy()
+        if values_all.size == 0:
+            continue
+        outlier_mask, lower, upper = _outlier_mask(values_all)
+        values = values_all[~outlier_mask] if exclude_outliers else values_all
         if values.size == 0:
+            logging.warning("All mouse FCT values are outliers for %s", proto)
             continue
         line = _plot_cdf(ax, values, proto)
         color = line.get_color()
-        p50 = np.percentile(values, 50)
-        p90 = np.percentile(values, 90)
-        p99 = np.percentile(values, 99)
+        p50, p90, p99 = np.percentile(values, [50, 90, 99])
         ax.scatter(
             [p50, p90, p99],
             [0.5, 0.9, 0.99],
@@ -361,6 +380,20 @@ def plot_fct_cdf(
             label=f"{proto} p50/p90/p99",
         )
         line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
+        if mark_outliers and not exclude_outliers and outlier_mask.any():
+            values_sorted = np.sort(values_all)
+            y = np.arange(1, len(values_sorted) + 1) / len(values_sorted)
+            sorted_mask = (values_sorted < lower) | (values_sorted > upper)
+            ax.scatter(
+                values_sorted[sorted_mask],
+                y[sorted_mask],
+                facecolors="none",
+                edgecolors=color,
+                marker="o",
+                s=24,
+                linewidth=1.0,
+                label=f"{proto} outliers",
+            )
         has_data = True
 
     if not has_data:
@@ -368,7 +401,10 @@ def plot_fct_cdf(
     else:
         ax.set_xlabel("FCT (s)")
         ax.set_ylabel("CDF")
-        ax.set_title("Mouse FCT CDF")
+        title = "Mouse FCT CDF"
+        if exclude_outliers:
+            title += " (outliers removed, 1.5x IQR)"
+        ax.set_title(title)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.legend()
     fig.tight_layout()
@@ -377,7 +413,12 @@ def plot_fct_cdf(
 
 
 def plot_fct_histogram(
-    mouse_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
+    mouse_df: pd.DataFrame,
+    output_path: Path,
+    protos: Sequence[str],
+    *,
+    exclude_outliers: bool = False,
+    mark_outliers: bool = False,
 ) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
     required_cols = {"proto", "fct_s"}
@@ -388,25 +429,49 @@ def plot_fct_histogram(
         plt.close(fig)
         return
 
-    has_data = False
-    percentile_annos: List[Tuple[str, Tuple[float, float, float], Any]] = []
-    max_count = 0.0
-    all_values_ms = (mouse_df["fct_s"] * 1000).to_numpy()
-    bins = (
-        np.histogram_bin_edges(all_values_ms, bins="auto") if all_values_ms.size else None
-    )
-
+    values_by_proto: Dict[str, np.ndarray] = {}
+    outliers_by_proto: Dict[str, np.ndarray] = {}
     for proto in protos:
         subset = mouse_df[mouse_df["proto"] == proto]
         if subset.empty:
             logging.warning("No mouse FCT data for %s", proto)
             continue
-        values_ms = subset["fct_s"].to_numpy() * 1000
+        values_all = subset["fct_s"].to_numpy()
+        if values_all.size == 0:
+            continue
+        outlier_mask, _, _ = _outlier_mask(values_all)
+        outliers_by_proto[proto] = values_all[outlier_mask]
+        values = values_all[~outlier_mask] if exclude_outliers else values_all
+        if values.size == 0:
+            logging.warning("All mouse FCT values are outliers for %s", proto)
+            continue
+        values_by_proto[proto] = values
+
+    all_values_ms = (
+        np.concatenate([vals * 1000 for vals in values_by_proto.values()])
+        if values_by_proto
+        else np.array([])
+    )
+    bins = (
+        np.histogram_bin_edges(all_values_ms, bins="auto") if all_values_ms.size else None
+    )
+
+    has_data = False
+    percentile_annos: List[Tuple[str, Tuple[float, float, float], Any]] = []
+    outlier_annos: List[Tuple[np.ndarray, Any, str]] = []
+    max_count = 0.0
+
+    for proto in protos:
+        values = values_by_proto.get(proto)
+        if values is None:
+            continue
+        values_ms = values * 1000
         if values_ms.size == 0:
             continue
         counts, _, patches = ax.hist(
             values_ms,
             bins=bins if bins is not None and bins.size > 1 else "auto",
+            density=True,
             alpha=0.65,
             label=proto,
             edgecolor="black",
@@ -421,6 +486,10 @@ def plot_fct_histogram(
             for patch in patches[1:]:
                 patch.set_label("_nolegend_")
         percentile_annos.append((proto, (p50, p90, p99), color))
+        if mark_outliers and not exclude_outliers:
+            outliers = outliers_by_proto.get(proto)
+            if outliers is not None and outliers.size:
+                outlier_annos.append((outliers * 1000, color, proto))
         has_data = True
 
     if not has_data:
@@ -446,10 +515,25 @@ def plot_fct_histogram(
                 s=25,
                 label=f"{proto} p50/p90/p99",
             )
+        if mark_outliers and not exclude_outliers:
+            for values_ms, color, proto in outlier_annos:
+                ax.scatter(
+                    values_ms,
+                    [marker_y] * len(values_ms),
+                    facecolors="none",
+                    edgecolors=color,
+                    marker="o",
+                    s=24,
+                    linewidth=1.0,
+                    label=f"{proto} outliers",
+                )
         ax.set_ylim(top=marker_y * 1.1)
         ax.set_xlabel("FCT (ms)")
-        ax.set_ylabel("Frequency")
-        ax.set_title("Mouse FCT Distribution")
+        ax.set_ylabel("Density")
+        title = "Mouse FCT Distribution"
+        if exclude_outliers:
+            title += " (outliers removed, 1.5x IQR)"
+        ax.set_title(title)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.legend()
     fig.tight_layout()
@@ -612,11 +696,25 @@ def main() -> None:
         mouse_df,
         output_dir / "whitebox_fct_cdf.png",
         PROTO_ORDER,
+        mark_outliers=True,
+    )
+    plot_fct_cdf(
+        mouse_df,
+        output_dir / "whitebox_fct_cdf_no_outliers.png",
+        PROTO_ORDER,
+        exclude_outliers=True,
     )
     plot_fct_histogram(
         mouse_df,
         output_dir / "whitebox_fct_hist.png",
         PROTO_ORDER,
+        mark_outliers=True,
+    )
+    plot_fct_histogram(
+        mouse_df,
+        output_dir / "whitebox_fct_hist_no_outliers.png",
+        PROTO_ORDER,
+        exclude_outliers=True,
     )
 
     if args.heatmap_mode == "pivot":
