@@ -132,6 +132,13 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _find_retrans_column(columns: Sequence[str]) -> str | None:
+    for name in ("retrans.", "retrans", "retransmissions", "retransmission"):
+        if name in columns:
+            return name
+    return None
+
+
 def _pair_id_from_filename(path: Path, prefix: str) -> str:
     """
     Extract a pair identifier from a filename with a known prefix.
@@ -173,7 +180,7 @@ def load_elephant_goodput(csv_path: Path) -> List[float]:
     return goodput_mbps.tolist()
 
 
-def load_mouse_fcts(csv_path: Path) -> List[float]:
+def load_mouse_fcts(csv_path: Path) -> List[Dict[str, object]]:
     try:
         df = pd.read_csv(csv_path)
     except FileNotFoundError:
@@ -189,8 +196,18 @@ def load_mouse_fcts(csv_path: Path) -> List[float]:
         return []
 
     durations = pd.to_numeric(df["Duration"], errors="coerce")
-    durations = durations[(durations.notna()) & (durations > 0)]
-    return durations.tolist()
+    valid = durations.notna() & (durations > 0)
+    if valid.sum() == 0:
+        return []
+    retrans_col = _find_retrans_column(df.columns)
+    if retrans_col is None:
+        retrans_vals = pd.Series(0, index=df.index, dtype=float)
+    else:
+        retrans_vals = pd.to_numeric(df[retrans_col], errors="coerce").fillna(0)
+    rows: List[Dict[str, object]] = []
+    for duration, retrans in zip(durations[valid], retrans_vals[valid]):
+        rows.append({"fct_s": float(duration), "had_retrans": bool(float(retrans) > 0)})
+    return rows
 
 
 def _extract_tx_bytes(entry: Mapping[str, float]) -> float:
@@ -279,13 +296,13 @@ def collect_all_data(
 
             for csv_path in mouse_paths:
                 pair_id = _pair_id_from_filename(csv_path, "mouse")
-                for fct in load_mouse_fcts(csv_path):
+                for row in load_mouse_fcts(csv_path):
                     mouse_rows.append(
                         {
                             "proto": proto,
                             "run_id": run_id,
                             "pair_id": pair_id,
-                            "fct_s": float(fct),
+                            **row,
                         }
                     )
 
@@ -395,6 +412,10 @@ def plot_mouse_fct_cdf(
         values_all = subset["fct_s"].to_numpy()
         if values_all.size == 0:
             continue
+        if "had_retrans" in subset.columns:
+            had_retrans_all = subset["had_retrans"].to_numpy().astype(bool)
+        else:
+            had_retrans_all = np.zeros(values_all.shape, dtype=bool)
         outlier_mask, lower, upper = _outlier_mask(values_all)
         values = values_all[~outlier_mask] if exclude_outliers else values_all
         if values.size == 0:
@@ -413,19 +434,38 @@ def plot_mouse_fct_cdf(
         )
         line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
         if mark_outliers and not exclude_outliers and outlier_mask.any():
-            values_sorted = np.sort(values_all)
+            sort_idx = np.argsort(values_all)
+            values_sorted = values_all[sort_idx]
+            retrans_sorted = had_retrans_all[sort_idx]
             y = np.arange(1, len(values_sorted) + 1) / len(values_sorted)
             sorted_mask = (values_sorted < lower) | (values_sorted > upper)
-            ax.scatter(
-                values_sorted[sorted_mask],
-                y[sorted_mask],
-                facecolors="none",
-                edgecolors=color,
-                marker="o",
-                s=24,
-                linewidth=1.0,
-                label=f"{proto} outliers",
-            )
+            outlier_y = y[sorted_mask]
+            outlier_values = values_sorted[sorted_mask]
+            outlier_retrans = retrans_sorted[sorted_mask]
+            no_retrans_mask = ~outlier_retrans
+            has_retrans_mask = outlier_retrans
+            if np.any(no_retrans_mask):
+                ax.scatter(
+                    outlier_values[no_retrans_mask],
+                    outlier_y[no_retrans_mask],
+                    facecolors="none",
+                    edgecolors=color,
+                    marker="o",
+                    s=24,
+                    linewidth=1.0,
+                    label=f"{proto} outliers (no retrans)",
+                )
+            if np.any(has_retrans_mask):
+                ax.scatter(
+                    outlier_values[has_retrans_mask],
+                    outlier_y[has_retrans_mask],
+                    facecolors=color,
+                    edgecolors=color,
+                    marker="s",
+                    s=24,
+                    linewidth=0.8,
+                    label=f"{proto} outliers (retrans)",
+                )
         has_data = True
 
     if not has_data:
@@ -463,6 +503,7 @@ def plot_mouse_fct_histogram(
 
     values_by_proto: Dict[str, np.ndarray] = {}
     outliers_by_proto: Dict[str, np.ndarray] = {}
+    outlier_retrans_by_proto: Dict[str, np.ndarray] = {}
     for proto in protos:
         subset = mouse_df[mouse_df["proto"] == proto]
         if subset.empty:
@@ -471,8 +512,13 @@ def plot_mouse_fct_histogram(
         values_all = subset["fct_s"].to_numpy()
         if values_all.size == 0:
             continue
+        if "had_retrans" in subset.columns:
+            had_retrans_all = subset["had_retrans"].to_numpy().astype(bool)
+        else:
+            had_retrans_all = np.zeros(values_all.shape, dtype=bool)
         outlier_mask, _, _ = _outlier_mask(values_all)
         outliers_by_proto[proto] = values_all[outlier_mask]
+        outlier_retrans_by_proto[proto] = had_retrans_all[outlier_mask]
         values = values_all[~outlier_mask] if exclude_outliers else values_all
         if values.size == 0:
             logging.warning("All mouse FCT values are outliers for %s", proto)
@@ -490,7 +536,7 @@ def plot_mouse_fct_histogram(
 
     has_data = False
     percentile_annos: List[Tuple[str, Tuple[float, float, float], Any]] = []
-    outlier_annos: List[Tuple[np.ndarray, Any, str]] = []
+    outlier_annos: List[Tuple[np.ndarray, Any, str, bool]] = []
     max_count = 0.0
 
     for proto in protos:
@@ -520,8 +566,14 @@ def plot_mouse_fct_histogram(
         percentile_annos.append((proto, (p50, p90, p99), color))
         if mark_outliers and not exclude_outliers:
             outliers = outliers_by_proto.get(proto)
-            if outliers is not None and outliers.size:
-                outlier_annos.append((outliers * 1000, color, proto))
+            outlier_retrans = outlier_retrans_by_proto.get(proto)
+            if outliers is not None and outliers.size and outlier_retrans is not None:
+                no_retrans = outliers[~outlier_retrans]
+                has_retrans = outliers[outlier_retrans]
+                if no_retrans.size:
+                    outlier_annos.append((no_retrans * 1000, color, proto, False))
+                if has_retrans.size:
+                    outlier_annos.append((has_retrans * 1000, color, proto, True))
         has_data = True
 
     if not has_data:
@@ -548,17 +600,29 @@ def plot_mouse_fct_histogram(
                 label=f"{proto} p50/p90/p99",
             )
         if mark_outliers and not exclude_outliers:
-            for values_ms, color, proto in outlier_annos:
-                ax.scatter(
-                    values_ms,
-                    [marker_y] * len(values_ms),
-                    facecolors="none",
-                    edgecolors=color,
-                    marker="o",
-                    s=24,
-                    linewidth=1.0,
-                    label=f"{proto} outliers",
-                )
+            for values_ms, color, proto, had_retrans in outlier_annos:
+                if had_retrans:
+                    ax.scatter(
+                        values_ms,
+                        [marker_y] * len(values_ms),
+                        facecolors=color,
+                        edgecolors=color,
+                        marker="s",
+                        s=24,
+                        linewidth=0.8,
+                        label=f"{proto} outliers (retrans)",
+                    )
+                else:
+                    ax.scatter(
+                        values_ms,
+                        [marker_y] * len(values_ms),
+                        facecolors="none",
+                        edgecolors=color,
+                        marker="o",
+                        s=24,
+                        linewidth=1.0,
+                        label=f"{proto} outliers (no retrans)",
+                    )
         ax.set_ylim(top=marker_y * 1.1)
         ax.set_xlabel("FCT (ms)")
         ax.set_ylabel("Density")
