@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
@@ -32,6 +33,18 @@ PROTO_ORDER = ("quic", "mpquic")
 HEATMAP_MAX_IFACES = 20  # Limit for readability; trim if there are many ifaces.
 MOUSE_DROPLOSS_FILENAME = "whitebox_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "whitebox_mouse_retrans_ratio.png"
+RUN_ID_PATTERN = re.compile(r"^run_\d{8}-\d{6}$")
+PROGRESS_INTERVAL = 5
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid integer: {value}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Value must be a positive integer.")
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,13 +68,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose logging.",
     )
-    parser.add_argument(
+    run_select = parser.add_mutually_exclusive_group()
+    run_select.add_argument(
         "--run-id",
         action="append",
         help=(
             "Run ID(s) to include (e.g., run_20251202-074952). "
             "Can be specified multiple times. "
             "Default: use the latest run_* per protocol."
+        ),
+    )
+    run_select.add_argument(
+        "--latest-n",
+        type=_positive_int,
+        help=(
+            "Select the latest N run_* per protocol. "
+            "Requires at least N runs for each protocol."
         ),
     )
     parser.add_argument(
@@ -92,25 +114,41 @@ def list_run_dirs(log_root: Path, proto: str) -> List[Path]:
     if not proto_dir.is_dir():
         logging.warning("Protocol path is not a directory: %s", proto_dir)
         return []
-    return sorted(
-        [d for d in proto_dir.iterdir() if d.is_dir() and d.name.startswith("run_")]
-    )
+    run_dirs: List[Path] = []
+    for entry in proto_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        if not entry.name.startswith("run_"):
+            continue
+        if not RUN_ID_PATTERN.match(entry.name):
+            logging.warning("Ignoring run dir with unexpected name: %s", entry)
+            continue
+        run_dirs.append(entry)
+    return sorted(run_dirs, key=lambda path: path.name)
 
 
 def select_run_dirs(
-    log_root: Path, protos: Sequence[str], run_ids: Sequence[str] | None
+    log_root: Path,
+    protos: Sequence[str],
+    run_ids: Sequence[str] | None,
+    latest_n: int | None,
 ) -> Dict[str, List[Path]]:
+    if run_ids and latest_n is not None:
+        raise ValueError("Cannot combine --run-id with --latest-n.")
     run_dirs_by_proto: Dict[str, List[Path]] = {}
     for proto in protos:
         available = list_run_dirs(log_root, proto)
+        if latest_n is not None and len(available) < latest_n:
+            raise ValueError(
+                f"Need at least {latest_n} run(s) for {proto} under {log_root}, "
+                f"found {len(available)}."
+            )
         if not available:
             logging.warning("No run_* directories found for %s under %s", proto, log_root)
             run_dirs_by_proto[proto] = []
             continue
 
-        if not run_ids:
-            selected = available[-1:]
-        else:
+        if run_ids:
             available_by_name = {d.name: d for d in available}
             selected = []
             for rid in run_ids:
@@ -119,6 +157,10 @@ def select_run_dirs(
                     selected.append(path)
                 else:
                     logging.warning("Requested run_id %s not found under %s", rid, proto)
+        elif latest_n is not None:
+            selected = available[-latest_n:]
+        else:
+            selected = available[-1:]
         run_dirs_by_proto[proto] = selected
     return run_dirs_by_proto
 
@@ -233,13 +275,20 @@ def collect_all_data(
     mouse_rows: List[Dict[str, object]] = []
     link_rows: List[Dict[str, object]] = []
 
+    if run_dirs_by_proto is None:
+        run_dirs_by_proto = {proto: list_run_dirs(log_root, proto) for proto in protos}
+    total_runs = sum(len(runs) for runs in run_dirs_by_proto.values())
+    processed_runs = 0
+
     for proto in protos:
-        run_dirs = (
-            run_dirs_by_proto.get(proto, [])
-            if run_dirs_by_proto is not None
-            else list_run_dirs(log_root, proto)
-        )
+        run_dirs = run_dirs_by_proto.get(proto, [])
         for run_dir in run_dirs:
+            processed_runs += 1
+            if total_runs and (
+                processed_runs % PROGRESS_INTERVAL == 0
+                or processed_runs == total_runs
+            ):
+                logging.info("Collecting runs [%d/%d]", processed_runs, total_runs)
             run_id = run_dir.name
             elephant_path = run_dir / "elephant_client.csv"
             mouse_paths = sorted(run_dir.glob("mouse_client_*.csv"))
@@ -712,7 +761,16 @@ def main() -> None:
     logging.info("Writing outputs to %s", output_dir)
 
     log_root = LOG_ROOT_BASE / args.log_dir_name
-    run_dirs_by_proto = select_run_dirs(log_root, PROTO_ORDER, args.run_id)
+    try:
+        run_dirs_by_proto = select_run_dirs(
+            log_root,
+            PROTO_ORDER,
+            args.run_id,
+            args.latest_n,
+        )
+    except ValueError as exc:
+        logging.error("%s", exc)
+        raise SystemExit(1) from exc
     total_runs = sum(len(v) for v in run_dirs_by_proto.values())
     if total_runs == 0:
         logging.error(
@@ -811,6 +869,8 @@ def main() -> None:
 
         # Drop-induced retrans (per proto, aggregated across selected runs)
         droploss_summaries: List[droploss.DropLossSummary] = []
+        total_runs = sum(len(run_dirs_by_proto.get(proto, [])) for proto in PROTO_ORDER)
+        processed_runs = 0
         for proto in PROTO_ORDER:
             runs = run_dirs_by_proto.get(proto, [])
             if not runs:
@@ -818,6 +878,16 @@ def main() -> None:
             drop_total = 0
             total_flows = 0
             for run_dir in runs:
+                processed_runs += 1
+                if total_runs and (
+                    processed_runs % PROGRESS_INTERVAL == 0
+                    or processed_runs == total_runs
+                ):
+                    logging.info(
+                        "Summarizing drop-loss runs [%d/%d]",
+                        processed_runs,
+                        total_runs,
+                    )
                 summary = droploss.summarize_run(run_dir, label=proto)
                 drop_total += summary.drop_flows
                 total_flows += summary.total_flows
@@ -849,6 +919,8 @@ def main() -> None:
 
         # Any retrans (per proto, aggregated across selected runs)
         retrans_summaries = []
+        total_runs = sum(len(run_dirs_by_proto.get(proto, [])) for proto in PROTO_ORDER)
+        processed_runs = 0
         for proto in PROTO_ORDER:
             runs = run_dirs_by_proto.get(proto, [])
             if not runs:
@@ -856,6 +928,16 @@ def main() -> None:
             retrans_total = 0
             total_flows = 0
             for run_dir in runs:
+                processed_runs += 1
+                if total_runs and (
+                    processed_runs % PROGRESS_INTERVAL == 0
+                    or processed_runs == total_runs
+                ):
+                    logging.info(
+                        "Summarizing retrans runs [%d/%d]",
+                        processed_runs,
+                        total_runs,
+                    )
                 summary = retrans.summarize_run(run_dir, label=proto)
                 retrans_total += summary.retrans_flows
                 total_flows += summary.total_flows

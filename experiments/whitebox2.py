@@ -37,6 +37,7 @@ from topology import (
 
 WARMUP_SECONDS = 2
 DEFAULT_DURATION = 20.0  # measurement window (total runtime = warmup + duration)
+DEFAULT_KILL_GRACE_SECONDS = 10.0  # grace before SIGKILL when stopping processes
 ELEPHANT_PORT = 4443
 MOUSE_PORT = 4444
 DEFAULT_SEED = 12345
@@ -313,20 +314,22 @@ def _start_picoquic_server(
     return host.popen(cmd, shell=True)
 
 
-def _terminate_processes(procs: List) -> None:
+def _terminate_processes(procs: List, term_timeout: float = 3.0) -> None:
+    procs = [proc for proc in procs if proc]
+    if not procs:
+        return
     for proc in procs:
-        if not proc:
-            continue
         try:
             proc.terminate()
         except Exception:
             continue
+    deadline = time.time() + max(term_timeout, 0.0)
+    while time.time() < deadline:
+        if all(proc.poll() is not None for proc in procs):
+            return
+        time.sleep(0.1)
     for proc in procs:
-        if not proc:
-            continue
-        try:
-            proc.wait(timeout=3)
-        except Exception:
+        if proc.poll() is None:
             try:
                 proc.kill()
             except Exception:
@@ -479,6 +482,7 @@ def run_whitebox2_once(
     elephant_load_fraction: float,
     total_runs: Optional[int] = None,
     enable_qlog: bool = False,
+    kill_grace_seconds: float = DEFAULT_KILL_GRACE_SECONDS,
     output_subdir: Optional[Path] = None,
 ) -> Path:
     """Execute one whitebox2 experiment run and return the log directory."""
@@ -629,8 +633,10 @@ def run_whitebox2_once(
         for thread in mouse_threads:
             thread.join()
 
-        _wait_for_completion_then_terminate(
-            elephant_client_proc, wait_timeout=5, label=f"{run_tag} elephant client"
+        print(f"{run_tag} stopping clients (kill grace={kill_grace_seconds}s).")
+        _terminate_processes(
+            mouse_procs + [elephant_client_proc],
+            term_timeout=kill_grace_seconds,
         )
 
         after_stats = snapshot_switch_bytes(ctx)
@@ -644,7 +650,10 @@ def run_whitebox2_once(
         for thread in mouse_threads:
             if thread.is_alive():
                 thread.join(timeout=3)
-        _terminate_processes(mouse_procs + [elephant_client_proc] + server_procs)
+        _terminate_processes(
+            mouse_procs + [elephant_client_proc] + server_procs,
+            term_timeout=kill_grace_seconds,
+        )
         stop_fattree_topology(ctx)
         print(f"{run_tag} teardown complete.")
 
@@ -684,6 +693,12 @@ def main() -> None:
         action="store_true",
         help="Enable picoquicdemo -l qlog capture for servers (default: disabled for performance).",
     )
+    parser.add_argument(
+        "--kill-grace",
+        type=float,
+        default=DEFAULT_KILL_GRACE_SECONDS,
+        help="Seconds to wait after SIGTERM before SIGKILL when stopping clients/servers.",
+    )
     args = parser.parse_args()
 
     for run_idx in range(args.runs):
@@ -697,6 +712,7 @@ def main() -> None:
             elephant_load_fraction=args.elephant_load_frac,
             total_runs=args.runs,
             enable_qlog=args.enable_qlog,
+            kill_grace_seconds=args.kill_grace,
             output_subdir=args.output_dir,
         )
 

@@ -477,10 +477,7 @@ def run_blackbox_once(
         for thread in mouse_threads:
             thread.join()
 
-        for proc in elephant_procs:
-            _wait_for_completion_then_terminate(
-                proc, wait_timeout=5, label=f"{run_tag} elephant client"
-            )
+        _terminate_processes(elephant_procs)
 
         after_stats = snapshot_switch_bytes(ctx)
         (log_dir / "switch_stats_after.json").write_text(
