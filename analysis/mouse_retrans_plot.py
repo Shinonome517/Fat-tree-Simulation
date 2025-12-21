@@ -13,7 +13,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Mapping, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
 import matplotlib
 import pandas as pd
@@ -21,6 +21,11 @@ import pandas as pd
 # Headless backend for batch environments.
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+
+try:
+    from analysis.csv_utils import find_retrans_column, normalize_columns
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from csv_utils import find_retrans_column, normalize_columns
 
 DEFAULT_LOG_ROOT = Path("./logs/whitebox")
 DEFAULT_OUTPUT_DIR = Path("./analysis/plots")
@@ -41,33 +46,6 @@ class RetransSummary:
         return self.retrans_flows / self.total_flows
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
-def _pick_column(df: pd.DataFrame, candidates: Sequence[str]) -> str | None:
-    """
-    Pick the first column matching any candidate (case/whitespace insensitive).
-    Trailing '.' in column headers is ignored.
-    """
-    normalized: Mapping[str, str] = {}
-    for col in df.columns:
-        key = str(col).strip().lower()
-        if key.endswith("."):
-            key = key[:-1]
-        normalized[key] = col
-
-    for cand in candidates:
-        key = cand.strip().lower()
-        if key.endswith("."):
-            key = key[:-1]
-        if key in normalized:
-            return normalized[key]
-    return None
-
-
 def _flow_has_retrans(csv_path: Path) -> bool:
     try:
         df = pd.read_csv(csv_path)
@@ -78,8 +56,8 @@ def _flow_has_retrans(csv_path: Path) -> bool:
         logging.warning("Failed to read %s: %s", csv_path, exc)
         return False
 
-    df = _normalize_columns(df)
-    retrans_col = _pick_column(df, ["retrans.", "retrans", "retransmissions"])
+    df = normalize_columns(df)
+    retrans_col = find_retrans_column(df.columns)
     if retrans_col is None:
         logging.warning("Column 'retrans.' missing in %s", csv_path)
         return False
