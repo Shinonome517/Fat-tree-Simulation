@@ -1,8 +1,8 @@
 """Incast experiment: 1 Elephant vs 8 Mouse flows converging at c3.
 
 This scenario keeps log/analysis compatibility with whitebox: outputs land under
-logs/whitebox/default by default (override with --output-dir) and use the same
-CSV/JSON filenames so analyze_whitebox.py works unchanged.
+logs/incast/default by default (override with --output-dir) and use the same
+CSV/JSON filenames so analyze_whitebox.py can be reused if pointed there.
 """
 
 import argparse
@@ -496,8 +496,8 @@ def run_incast_once(
     )
     print(f"{run_tag} building topology...")
 
-    log_root = Path("logs/whitebox") / (output_subdir or Path("default"))
-    log_dir = make_log_dir("whitebox", proto, log_root=log_root)
+    log_root = Path("logs/incast") / (output_subdir or Path("default"))
+    log_dir = make_log_dir("incast", proto, log_root=log_root)
 
     ctx = None
     elephant_client_proc = None
@@ -671,8 +671,8 @@ def main() -> None:
         type=Path,
         default=Path("default"),
         help=(
-            "Subdirectory name under logs/whitebox. Each run writes to "
-            "logs/whitebox/<output-dir>/<proto>/run_<timestamp> (default: default)."
+            "Subdirectory name under logs/incast. Each run writes to "
+            "logs/incast/<output-dir>/<proto>/run_<timestamp> (default: default)."
         ),
     )
     parser.add_argument(
