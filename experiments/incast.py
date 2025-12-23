@@ -36,8 +36,11 @@ from topology import (
 )
 
 WARMUP_SECONDS = 2
-DEFAULT_DURATION = 20.0  # measurement window (total runtime = warmup + duration)
-DEFAULT_KILL_GRACE_SECONDS = 30.0  # grace before SIGKILL when stopping processes
+DEFAULT_DURATION = 20.0  # measurement window used for auto-sizing Elephant payload
+DEFAULT_KILL_GRACE_SECONDS = 10.0  # grace before SIGKILL when stopping processes
+SERVER_IDLE_TIMEOUT_MS = 5000
+CONGESTION_CONTROL = "cubic"
+ELEPHANT_PROGRESS_INTERVAL = 10.0
 ELEPHANT_PORT = 4443
 MOUSE_PORT = 4444
 DEFAULT_SEED = 12345
@@ -122,26 +125,29 @@ def get_extra_args(proto: str, role: str) -> List[str]:
     """
     Return picoquicdemo extra CLI arguments based on proto and role.
 
-    - quic: always single-path (no extra args).
+    - quic: single-path, but always enforce congestion control selection.
     - mpquic:
         * Elephant server: -M
         * Elephant client: -M plus -A (client-only multi-IP advertisement)
         * Mouse server/client: keep single-path (no -M/-A)
     """
     proto = (proto or "").lower()
+    base_args: List[str] = []
+    if CONGESTION_CONTROL:
+        base_args = ["-G", CONGESTION_CONTROL]
     if proto != "mpquic":
-        return []
+        return base_args
 
     if role == ROLE_ELEPHANT_SERVER:
-        return ["-M"]
+        return base_args + ["-M"]
     if role == ROLE_ELEPHANT_CLIENT:
-        args: List[str] = ["-M"]
+        args: List[str] = base_args + ["-M"]
         if ELEPHANT_ALT_ADDRS_MPQUIC:
             args += ["-A", ELEPHANT_ALT_ADDRS_MPQUIC]
         return args
     if role in (ROLE_MOUSE_SERVER, ROLE_MOUSE_CLIENT):
-        return []
-    return []
+        return base_args
+    return base_args
 
 
 def configure_paths_for_incast(ctx, proto: str) -> None:
@@ -313,6 +319,71 @@ def _start_picoquic_server(
     return host.popen(cmd, shell=True)
 
 
+def _select_primary_intf(host) -> Optional[str]:
+    if not host:
+        return None
+    for intf in host.intfList():
+        name = getattr(intf, "name", None)
+        if name and name != "lo":
+            return name
+    return None
+
+
+def _read_host_tx_bytes(host, intf_name: str) -> Optional[int]:
+    if not host or not intf_name:
+        return None
+    raw = host.cmd(f"cat /sys/class/net/{intf_name}/statistics/tx_bytes 2>/dev/null").strip()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _log_elephant_progress(
+    host,
+    proc,
+    target_bytes: int,
+    stop_event: threading.Event,
+    interval: float = ELEPHANT_PROGRESS_INTERVAL,
+    run_label: str = "",
+) -> None:
+    prefix = f"{run_label} " if run_label else ""
+    # Use interface tx_bytes as a coarse proxy for Elephant send progress.
+    intf_name = _select_primary_intf(host)
+    if not intf_name:
+        print(f"{prefix}[elephant-progress] no interface found; progress logging disabled.")
+        return
+    start_bytes = _read_host_tx_bytes(host, intf_name)
+    if start_bytes is None:
+        print(f"{prefix}[elephant-progress] tx_bytes unavailable; progress logging disabled.")
+        return
+    next_log = time.time() + max(interval, 1.0)
+    while not stop_event.is_set():
+        if proc and proc.poll() is not None:
+            break
+        now = time.time()
+        if now >= next_log:
+            current_bytes = _read_host_tx_bytes(host, intf_name)
+            if current_bytes is not None and target_bytes > 0:
+                sent_bytes = max(0, current_bytes - start_bytes)
+                progress = min(sent_bytes / target_bytes, 1.0)
+                print(
+                    f"{prefix}[elephant-progress] sent={sent_bytes} bytes "
+                    f"({progress * 100:.1f}%), target={target_bytes}"
+                )
+            next_log = now + max(interval, 1.0)
+        stop_event.wait(0.5)
+
+    current_bytes = _read_host_tx_bytes(host, intf_name)
+    if current_bytes is not None and target_bytes > 0:
+        sent_bytes = max(0, current_bytes - start_bytes)
+        progress = min(sent_bytes / target_bytes, 1.0)
+        print(
+            f"{prefix}[elephant-progress] final sent={sent_bytes} bytes "
+            f"({progress * 100:.1f}%), target={target_bytes}"
+        )
+
+
 def _terminate_processes(procs: List, term_timeout: float = 3.0) -> None:
     procs = [proc for proc in procs if proc]
     if not procs:
@@ -371,7 +442,7 @@ def _run_mouse_flows(
     server_ip: str,
     log_dir: Path,
     start_time: float,
-    total_duration: float,
+    total_duration: Optional[float],
     stop_event: threading.Event,
     proc_store: List,
     extra_args: List[str],
@@ -381,20 +452,21 @@ def _run_mouse_flows(
 ):
     seq = 0
     last_heartbeat = start_time
+    has_duration = total_duration is not None
     prefix = f"{run_label} " if run_label else ""
     while not stop_event.is_set():
         now = time.time()
         if now - last_heartbeat >= heartbeat_interval:
             print(f"{prefix}[mouse-gen:{host_label}] alive t={now - start_time:.1f}s, flows={seq}")
             last_heartbeat = now
-        if now >= start_time + total_duration:
+        if has_duration and now >= start_time + total_duration:
             break
 
         sleep_time = random.expovariate(lambda_rate)
         stop_event.wait(sleep_time)
         if stop_event.is_set():
             break
-        if time.time() >= start_time + total_duration:
+        if has_duration and time.time() >= start_time + total_duration:
             break
 
         seq += 1
@@ -501,6 +573,10 @@ def run_incast_once(
 
     ctx = None
     elephant_client_proc = None
+    elephant_server_proc = None
+    mouse_server_proc = None
+    elephant_progress_stop = threading.Event()
+    elephant_progress_thread: Optional[threading.Thread] = None
     mouse_threads: List[threading.Thread] = []
     mouse_stop = threading.Event()
     mouse_procs: List = []
@@ -524,28 +600,31 @@ def run_incast_once(
         # Start picoquicdemo servers for Elephant and Mouse.
         elephant_server_log = log_dir / "elephant_server.log"
         mouse_server_log = log_dir / "mouse_server.log"
-        elephant_server_args = get_extra_args(proto, ROLE_ELEPHANT_SERVER)
-        mouse_server_args = get_extra_args(proto, ROLE_MOUSE_SERVER)
-        server_procs.append(
-            _start_picoquic_server(
-                server_host,
-                ELEPHANT_PORT,
-                elephant_server_log,
-                ELEPHANT_SERVER_CMD_TEMPLATE,
-                elephant_server_args,
-                enable_qlog,
-            )
+        elephant_server_args = get_extra_args(proto, ROLE_ELEPHANT_SERVER) + [
+            "-d",
+            str(SERVER_IDLE_TIMEOUT_MS),
+        ]
+        mouse_server_args = get_extra_args(proto, ROLE_MOUSE_SERVER) + [
+            "-d",
+            str(SERVER_IDLE_TIMEOUT_MS),
+        ]
+        elephant_server_proc = _start_picoquic_server(
+            server_host,
+            ELEPHANT_PORT,
+            elephant_server_log,
+            ELEPHANT_SERVER_CMD_TEMPLATE,
+            elephant_server_args,
+            enable_qlog,
         )
-        server_procs.append(
-            _start_picoquic_server(
-                server_host,
-                MOUSE_PORT,
-                mouse_server_log,
-                MOUSE_SERVER_CMD_TEMPLATE,
-                mouse_server_args,
-                enable_qlog,
-            )
+        mouse_server_proc = _start_picoquic_server(
+            server_host,
+            MOUSE_PORT,
+            mouse_server_log,
+            MOUSE_SERVER_CMD_TEMPLATE,
+            mouse_server_args,
+            enable_qlog,
         )
+        server_procs.extend([elephant_server_proc, mouse_server_proc])
 
         configure_paths_for_incast(ctx, proto)
         print(f"{run_tag} policy routing configured.")
@@ -590,7 +669,7 @@ def run_incast_once(
         elephant_extra = get_extra_args(proto, ROLE_ELEPHANT_CLIENT)
         print(
             f"{run_tag} starting elephant client "
-            f"(duration={total_duration}s, payload_bytes={elephant_target_bytes})."
+            f"(target_duration={total_duration}s, payload_bytes={elephant_target_bytes})."
         )
         elephant_cmd = picoquic_perf_cmd(
             server_ip=server_ip,
@@ -600,6 +679,19 @@ def run_incast_once(
             extra_args=elephant_extra,
         )
         elephant_client_proc = elephant_client.popen(elephant_cmd, shell=True)
+        if elephant_client_proc:
+            elephant_progress_thread = threading.Thread(
+                target=_log_elephant_progress,
+                args=(
+                    elephant_client,
+                    elephant_client_proc,
+                    elephant_target_bytes,
+                    elephant_progress_stop,
+                ),
+                kwargs={"interval": ELEPHANT_PROGRESS_INTERVAL, "run_label": run_tag},
+                daemon=True,
+            )
+            elephant_progress_thread.start()
 
         mouse_extra = get_extra_args(proto, ROLE_MOUSE_CLIENT)
         start_time = time.time()
@@ -613,7 +705,7 @@ def run_incast_once(
                     server_ip,
                     log_dir,
                     start_time,
-                    total_duration,
+                    None,
                     mouse_stop,
                     mouse_procs,
                     mouse_extra,
@@ -626,15 +718,31 @@ def run_incast_once(
             thread.start()
             mouse_threads.append(thread)
 
-        print(f"{run_tag} traffic running; warmup+duration={total_duration}s.")
-        time.sleep(total_duration)
+        print(f"{run_tag} traffic running; waiting for elephant completion.")
+        elephant_exit_code = None
+        if elephant_client_proc:
+            try:
+                elephant_exit_code = elephant_client_proc.wait()
+            except Exception as exc:
+                print(f"{run_tag} elephant wait error: {exc}")
+        elephant_progress_stop.set()
+        if elephant_progress_thread:
+            elephant_progress_thread.join(timeout=2)
+        if elephant_exit_code is not None:
+            print(f"{run_tag} elephant client exited with code {elephant_exit_code}.")
+
+        print(f"{run_tag} waiting for elephant server idle timeout ({SERVER_IDLE_TIMEOUT_MS}ms).")
+        time.sleep(SERVER_IDLE_TIMEOUT_MS / 1000 + 0.2)
+        if elephant_server_proc and elephant_server_proc.poll() is None:
+            print(f"{run_tag} elephant server still running after idle timeout.")
+
         mouse_stop.set()
         for thread in mouse_threads:
             thread.join()
 
         print(f"{run_tag} stopping clients (kill grace={kill_grace_seconds}s).")
         _terminate_processes(
-            mouse_procs + [elephant_client_proc],
+            mouse_procs,
             term_timeout=kill_grace_seconds,
         )
 
@@ -645,6 +753,9 @@ def run_incast_once(
         print(f"{run_tag} switch stats captured (after).")
     finally:
         print(f"{run_tag} tearing down topology and processes...")
+        elephant_progress_stop.set()
+        if elephant_progress_thread and elephant_progress_thread.is_alive():
+            elephant_progress_thread.join(timeout=2)
         mouse_stop.set()
         for thread in mouse_threads:
             if thread.is_alive():
