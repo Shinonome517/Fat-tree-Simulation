@@ -16,6 +16,11 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+# Ensure the repository root is on sys.path when executed as a script.
+import sys
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 from experiments import (
     create_fattree,
     make_log_dir,
@@ -30,7 +35,8 @@ from topology import (
     stop_fattree_topology,
 )
 
-WARMUP_SECONDS = 5
+WARMUP_SECONDS = 2
+DEFAULT_DURATION = 20.0  # measurement window (total runtime = warmup + duration)
 ELEPHANT_PORT = 4443
 MOUSE_PORT = 4444
 DEFAULT_SEED = 12345
@@ -329,6 +335,7 @@ def _wait_for_completion_then_terminate(
 
 def _run_mouse_flows(
     host,
+    host_label: str,
     server_ip: str,
     log_dir: Path,
     start_time: float,
@@ -358,7 +365,7 @@ def _run_mouse_flows(
             break
 
         seq += 1
-        csv_path = log_dir / f"mouse_client_{seq:04d}.csv"
+        csv_path = log_dir / f"mouse_client_{host_label}_{seq:04d}.csv"
         size_bytes = random.randint(MOUSE_SIZE_MIN, MOUSE_SIZE_MAX)
         scenario = f"*1:{size_bytes}:0;"
         mouse_cmd = picoquic_perf_cmd(
@@ -440,7 +447,8 @@ def run_whitebox_once(
     elephant_load_fraction: float,
     total_runs: Optional[int] = None,
     enable_qlog: bool = False,
-) -> None:
+    output_subdir: Optional[Path] = None,
+) -> Path:
     """Execute one whitebox experiment run."""
     seed = base_seed + run_index
     random.seed(seed)
@@ -453,7 +461,8 @@ def run_whitebox_once(
     )
     print(f"{run_tag} building topology...")
 
-    log_dir = make_log_dir("whitebox", proto)
+    log_root = Path("logs/whitebox") / (output_subdir or Path("default"))
+    log_dir = make_log_dir("whitebox", proto, log_root=log_root)
 
     ctx = None
     elephant_client_proc = None
@@ -563,6 +572,7 @@ def run_whitebox_once(
             target=_run_mouse_flows,
             args=(
                 mouse_client,
+                mouse_client.name,
                 server_ip,
                 log_dir,
                 start_time,
@@ -600,6 +610,7 @@ def run_whitebox_once(
         _terminate_processes(mouse_procs + [elephant_client_proc] + server_procs)
         stop_fattree_topology(ctx)
         print(f"{run_tag} teardown complete.")
+    return log_dir
 
 
 def main() -> None:
@@ -607,8 +618,17 @@ def main() -> None:
     parser.add_argument("--proto", required=True, choices=["quic", "mpquic"])
     parser.add_argument("--runs", type=int, default=4)
     parser.add_argument("--k", type=int, default=4)
-    parser.add_argument("--duration", type=float, default=60.0)
+    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("default"),
+        help=(
+            "Subdirectory name under logs/whitebox. Each run writes to "
+            "logs/whitebox/<output-dir>/<proto>/run_<timestamp> (default: default)."
+        ),
+    )
     parser.add_argument(
         "--elephant-bytes",
         type=int,
@@ -639,6 +659,7 @@ def main() -> None:
             elephant_load_fraction=args.elephant_load_frac,
             total_runs=args.runs,
             enable_qlog=args.enable_qlog,
+            output_subdir=args.output_dir,
         )
 
 
