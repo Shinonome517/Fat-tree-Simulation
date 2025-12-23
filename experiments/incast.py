@@ -1,4 +1,4 @@
-"""Incast experiment: 1 Elephant vs 8 Mouse flows converging at c3.
+"""Incast experiment: 1 Elephant vs 18 Mouse flows converging at c5.
 
 This scenario keeps log/analysis compatibility with whitebox: outputs land under
 logs/incast/default by default (override with --output-dir) and use the same
@@ -7,6 +7,7 @@ CSV/JSON filenames so analyze_whitebox.py can be reused if pointed there.
 
 import argparse
 import json
+import math
 import random
 import re
 import shlex
@@ -47,13 +48,11 @@ DEFAULT_SEED = 12345
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario (1 stream, 1KB each way)
 DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
 DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
-MOUSE_SIZE_MIN = 4 * 1024
-MOUSE_SIZE_MAX = 64 * 1024
-MOUSE_TARGET_FRAC_OF_ELEPHANT = 0.25  # 8:2 (elephant:mouse) byte ratio -> mouse is 1/4 of elephant
-MOUSE_MEAN_SIZE_BYTES = (MOUSE_SIZE_MIN + MOUSE_SIZE_MAX) / 2
-
-# Poisson rate per Mouse host (flows/sec).
-MOUSE_LAMBDA_PER_HOST = 240
+MOUSE_SIZE_BYTES = 64 * 1024
+MOUSE_PERIOD_S = 0.004
+MOUSE_JITTER_STD_S = 0.001
+MOUSE_JITTER_CLIP_S = 0.002
+MOUSE_START_DELAY_S = 0.050
 
 # TODO: Adjust server options (certs/logging/paths) for actual experiments.
 PICOQUIC_CERT_PATH = "/etc/picoquic/server-cert.pem"
@@ -71,47 +70,55 @@ ROLE_ELEPHANT_CLIENT = "elephant-client"
 ROLE_MOUSE_SERVER = "mouse-server"
 ROLE_MOUSE_CLIENT = "mouse-client"
 
-# Hostnames used in this scenario (k=4 assumed unless overridden).
-ELEPHANT_HOSTNAME = "h001"
+# Hostnames used in this scenario (k=6 default, requires k>=6).
+ELEPHANT_HOSTNAME = "h000"
 MOUSE_HOSTNAMES = [
-    "h100",
-    "h101",
-    "h110",
-    "h111",
     "h200",
     "h201",
+    "h202",
     "h210",
     "h211",
+    "h212",
+    "h300",
+    "h301",
+    "h302",
+    "h310",
+    "h311",
+    "h312",
+    "h400",
+    "h402",
+    "h410",
+    "h401",
+    "h411",
+    "h412",
 ]
-SERVER_HOSTNAME = "h311"
+SERVER_HOSTNAME = "h522"
 
-# Source IPs for marking (primary addresses of all senders).
-S_IP_ELEPHANT = host_ip(0, 0, 1).split("/")[0]
-MOUSE_SOURCE_COORDS = [
-    (1, 0, 0),
-    (1, 0, 1),
-    (1, 1, 0),
-    (1, 1, 1),
-    (2, 0, 0),
-    (2, 0, 1),
-    (2, 1, 0),
-    (2, 1, 1),
-]
+# Source IPs for marking (primary addresses of all senders only).
+def _host_coords_from_name(hostname: str):
+    match = re.fullmatch(r"h(\d)(\d)(\d)", hostname)
+    if not match:
+        raise ValueError(f"Unexpected host name format: {hostname}")
+    return tuple(int(part) for part in match.groups())
+
+
+S_IP_ELEPHANT = host_ip(*_host_coords_from_name(ELEPHANT_HOSTNAME)).split("/")[0]
+MOUSE_SOURCE_COORDS = [_host_coords_from_name(name) for name in MOUSE_HOSTNAMES]
 S_IP_MICE = [host_ip(p, e, h).split("/")[0] for (p, e, h) in MOUSE_SOURCE_COORDS]
 SRC_IPS_FOR_MARK = [S_IP_ELEPHANT] + S_IP_MICE
 
 # Multipath QUIC: advertise client-only extra addresses (do not include S_IP_ELEPHANT).
 # Mininet hosts typically use ifindex 2 for eth0; adjust if assign_addresses changes.
-ELEPHANT_ALT_ADDRS_MPQUIC = "10.0.0.6/2,10.0.0.7/2,10.0.0.8/2"  # TODO: validate against actual ifindex/IPs
+ELEPHANT_ALT_ADDRS_MPQUIC = "10.0.0.2/2,10.0.0.3/2,10.0.0.4/2"  # TODO: validate against actual ifindex/IPs
 
-# Destination rack for whitebox collision (h311 lives in pod 3, edge 1).
-DST_POD = 3
-DST_EDGE = 1
-DST_AGG = 1  # Aggregation switch below c3 used for this rack.
+# Destination rack for whitebox collision (h522 lives in pod 5, edge 2).
+DST_POD = 5
+DST_EDGE = 2
+DST_AGG = 2  # Aggregation switch below c5 used for this rack.
 DST_SUBNET = net_24(DST_POD, DST_EDGE)
 
-# Core/uplink selection: force fwmark=0x1 traffic to traverse c3 -> a31.
-C3_INDEX = 3
+# Core/uplink selection: force fwmark=0x1 traffic to traverse c5 -> a52.
+C5_INDEX = 5
 POLICY_TABLE = 100
 FW_MARK = "0x1"
 
@@ -151,7 +158,7 @@ def get_extra_args(proto: str, role: str) -> List[str]:
 
 
 def configure_paths_for_incast(ctx, proto: str) -> None:
-    """Configure fwmark-based policy routing so all senders collide at c3."""
+    """Configure fwmark-based policy routing so all senders collide at c5."""
     print(f"[incast] Configuring incast paths for proto={proto}")
 
     n_hosts_per_edge = ctx.k // 2
@@ -159,8 +166,8 @@ def configure_paths_for_incast(ctx, proto: str) -> None:
     if ctx.k <= DST_POD or n_edges_per_pod <= DST_EDGE or n_hosts_per_edge <= 1:
         print("[incast] Topology smaller than expected; skipping policy routing setup.")
         return
-    if len(ctx.cores) <= C3_INDEX:
-        print("[incast] Core c3 not present; skipping policy routing setup.")
+    if len(ctx.cores) <= C5_INDEX:
+        print("[incast] Core c5 not present; skipping policy routing setup.")
         return
 
     def _run(node, cmd: str) -> None:
@@ -280,14 +287,14 @@ def configure_paths_for_incast(ctx, proto: str) -> None:
             )
         )
 
-    # Forward paths for Elephant (pod 0) and Mouse sources (pods 1 and 2, edges 0/1) toward c3 -> a31.
-    source_edges = [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1)]
+    # Forward paths for Elephant (pod 0) and Mouse sources (pods 2-4, edges 0/1) toward c5 -> a52.
+    source_edges = [(0, 0), (2, 0), (2, 1), (3, 0), (3, 1), (4, 0), (4, 1)]
     for pod, edge_idx in source_edges:
         _edge_route_to_agg(pod=pod, edge_idx=edge_idx, agg_idx=DST_AGG)
-        _agg_route_to_core(pod=pod, agg_idx=DST_AGG, core_idx=C3_INDEX)
+        _agg_route_to_core(pod=pod, agg_idx=DST_AGG, core_idx=C5_INDEX)
 
-    # Downstream from c3 into the destination rack (pod 3, edge 1).
-    _core_route_to_agg(core_idx=C3_INDEX, pod=DST_POD, agg_idx=DST_AGG)
+    # Downstream from c5 into the destination rack (pod 5, edge 2).
+    _core_route_to_agg(core_idx=C5_INDEX, pod=DST_POD, agg_idx=DST_AGG)
     _agg_route_to_edge(pod=DST_POD, agg_idx=DST_AGG, edge_idx=DST_EDGE)
     _edge_route_to_hosts(pod=DST_POD, edge_idx=DST_EDGE)
 
@@ -441,12 +448,12 @@ def _run_mouse_flows(
     host_label: str,
     server_ip: str,
     log_dir: Path,
+    grid_t0: float,
     start_time: float,
     total_duration: Optional[float],
     stop_event: threading.Event,
     proc_store: List,
     extra_args: List[str],
-    lambda_rate: float,
     heartbeat_interval: float = 10.0,
     run_label: str = "",
 ):
@@ -455,24 +462,37 @@ def _run_mouse_flows(
     has_duration = total_duration is not None
     prefix = f"{run_label} " if run_label else ""
     while not stop_event.is_set():
-        now = time.time()
+        now = time.monotonic()
         if now - last_heartbeat >= heartbeat_interval:
             print(f"{prefix}[mouse-gen:{host_label}] alive t={now - start_time:.1f}s, flows={seq}")
             last_heartbeat = now
         if has_duration and now >= start_time + total_duration:
             break
 
-        sleep_time = random.expovariate(lambda_rate)
-        stop_event.wait(sleep_time)
+        if now < grid_t0:
+            base_time = grid_t0
+        else:
+            n = math.floor((now - grid_t0) / MOUSE_PERIOD_S) + 1
+            base_time = grid_t0 + n * MOUSE_PERIOD_S
+
+        jitter = random.gauss(0.0, MOUSE_JITTER_STD_S)
+        if jitter > MOUSE_JITTER_CLIP_S:
+            jitter = MOUSE_JITTER_CLIP_S
+        elif jitter < -MOUSE_JITTER_CLIP_S:
+            jitter = -MOUSE_JITTER_CLIP_S
+
+        send_time = base_time + jitter
+        wait_time = send_time - now
+        if wait_time > 0:
+            stop_event.wait(wait_time)
         if stop_event.is_set():
             break
-        if has_duration and time.time() >= start_time + total_duration:
+        if has_duration and time.monotonic() >= start_time + total_duration:
             break
 
         seq += 1
         csv_path = log_dir / f"mouse_client_{host_label}_{seq:04d}.csv"
-        size_bytes = random.randint(MOUSE_SIZE_MIN, MOUSE_SIZE_MAX)
-        scenario = f"*1:{size_bytes}:0;"
+        scenario = f"*1:{MOUSE_SIZE_BYTES}:0;"
         mouse_cmd = picoquic_perf_cmd(
             server_ip=server_ip,
             server_port=MOUSE_PORT,
@@ -583,7 +603,7 @@ def run_incast_once(
     server_procs: List = []
 
     try:
-        ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=75)
+        ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=50)
         print(f"{run_tag} topology ready.")
 
         elephant_client = ctx.net.get(ELEPHANT_HOSTNAME)
@@ -694,7 +714,8 @@ def run_incast_once(
             elephant_progress_thread.start()
 
         mouse_extra = get_extra_args(proto, ROLE_MOUSE_CLIENT)
-        start_time = time.time()
+        start_time = time.monotonic()
+        grid_t0 = math.ceil((start_time + MOUSE_START_DELAY_S) / MOUSE_PERIOD_S) * MOUSE_PERIOD_S
         print(f"{run_tag} starting mouse generator threads for {len(mouse_clients)} hosts.")
         for mc in mouse_clients:
             thread = threading.Thread(
@@ -704,12 +725,12 @@ def run_incast_once(
                     mc.name,
                     server_ip,
                     log_dir,
+                    grid_t0,
                     start_time,
                     None,
                     mouse_stop,
                     mouse_procs,
                     mouse_extra,
-                    MOUSE_LAMBDA_PER_HOST,
                     10.0,
                     run_tag,
                 ),
@@ -774,7 +795,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Incast experiment driver.")
     parser.add_argument("--proto", required=True, choices=["quic", "mpquic"])
     parser.add_argument("--runs", type=int, default=4)
-    parser.add_argument("--k", type=int, default=4)
+    parser.add_argument("--k", type=int, default=6)
     parser.add_argument("--duration", type=float, default=DEFAULT_DURATION)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
@@ -810,6 +831,9 @@ def main() -> None:
         help="Seconds to wait after SIGTERM before SIGKILL when stopping clients/servers.",
     )
     args = parser.parse_args()
+
+    if args.k < 6:
+        parser.error(f"k must be >= 6 for this incast scenario (got {args.k}).")
 
     for run_idx in range(args.runs):
         run_incast_once(
