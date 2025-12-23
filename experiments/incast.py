@@ -1,4 +1,4 @@
-"""Incast experiment: 1 Elephant vs 18 Mouse flows converging at c5.
+"""Incast experiment: 1 Elephant vs 24 Mouse flows converging at c5.
 
 This scenario keeps log/analysis compatibility with whitebox: outputs land under
 logs/incast/default by default (override with --output-dir) and use the same
@@ -15,7 +15,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # Ensure the repository root is on sys.path when executed as a script.
 import sys
@@ -49,9 +49,9 @@ DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario (1 stream, 1KB
 DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
 DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
 MOUSE_SIZE_BYTES = 64 * 1024
-MOUSE_PERIOD_S = 0.004
-MOUSE_JITTER_STD_S = 0.001
-MOUSE_JITTER_CLIP_S = 0.002
+MOUSE_PERIOD_S = 0.20
+MOUSE_JITTER_STD_S = 0.0
+MOUSE_JITTER_CLIP_S = 0.0
 MOUSE_START_DELAY_S = 0.050
 
 # TODO: Adjust server options (certs/logging/paths) for actual experiments.
@@ -73,6 +73,12 @@ ROLE_MOUSE_CLIENT = "mouse-client"
 # Hostnames used in this scenario (k=6 default, requires k>=6).
 ELEPHANT_HOSTNAME = "h000"
 MOUSE_HOSTNAMES = [
+    "h100",
+    "h102",
+    "h110",
+    "h101",
+    "h111",
+    "h112",
     "h200",
     "h201",
     "h202",
@@ -287,8 +293,18 @@ def configure_paths_for_incast(ctx, proto: str) -> None:
             )
         )
 
-    # Forward paths for Elephant (pod 0) and Mouse sources (pods 2-4, edges 0/1) toward c5 -> a52.
-    source_edges = [(0, 0), (2, 0), (2, 1), (3, 0), (3, 1), (4, 0), (4, 1)]
+    # Forward paths for Elephant (pod 0) and Mouse sources (pods 1-4, edges 0/1) toward c5 -> a52.
+    source_edges = [
+        (0, 0),
+        (1, 0),
+        (1, 1),
+        (2, 0),
+        (2, 1),
+        (3, 0),
+        (3, 1),
+        (4, 0),
+        (4, 1),
+    ]
     for pod, edge_idx in source_edges:
         _edge_route_to_agg(pod=pod, edge_idx=edge_idx, agg_idx=DST_AGG)
         _agg_route_to_core(pod=pod, agg_idx=DST_AGG, core_idx=C5_INDEX)
@@ -443,6 +459,95 @@ def _wait_for_completion_then_terminate(
             pass
 
 
+def _summarize_lateness_ms(values: List[float]) -> Optional[Dict[str, float]]:
+    if not values:
+        return None
+    vals = sorted(values)
+    count = len(vals)
+    mean = sum(vals) / count
+    p95_idx = max(0, math.ceil(0.95 * count) - 1)
+    p95 = vals[p95_idx]
+    return {
+        "count": float(count),
+        "min_ms": vals[0],
+        "mean_ms": mean,
+        "p95_ms": p95,
+        "max_ms": vals[-1],
+        "gt1ms": float(sum(1 for v in vals if v > 1.0)),
+        "gt2ms": float(sum(1 for v in vals if v > 2.0)),
+        "gt4ms": float(sum(1 for v in vals if v > 4.0)),
+    }
+
+
+def _write_mouse_thread_start_log(
+    log_dir: Path,
+    start_time: float,
+    grid_t0: float,
+    schedule_stats: List[Dict[str, object]],
+) -> None:
+    if not schedule_stats:
+        return
+    grid_offset = grid_t0 - start_time
+    lines = ["host,thread_start_offset_s,grid_t0_offset_s"]
+    for stats in schedule_stats:
+        host = stats.get("host", "")
+        thread_start = stats.get("thread_start_s")
+        if thread_start is None:
+            continue
+        offset = float(thread_start) - start_time
+        lines.append(f"{host},{offset:.6f},{grid_offset:.6f}")
+    (log_dir / "mouse_thread_start.csv").write_text("\n".join(lines) + "\n")
+
+
+def _write_mouse_schedule_summary(
+    log_dir: Path,
+    start_time: float,
+    grid_t0: float,
+    schedule_stats: List[Dict[str, object]],
+) -> None:
+    if not schedule_stats:
+        return
+    lines: List[str] = []
+    grid_offset = grid_t0 - start_time
+    lines.append("Mouse schedule summary")
+    lines.append(f"grid_t0_offset_s={grid_offset:.6f}")
+    all_values: List[float] = []
+    for stats in schedule_stats:
+        host = stats.get("host", "")
+        values = stats.get("lateness_ms") or []
+        all_values.extend(values)
+        summary = _summarize_lateness_ms(values)
+        if summary is None:
+            lines.append(f"{host}: no data")
+            continue
+        lines.append(
+            f"{host}: count={int(summary['count'])} "
+            f"min_ms={summary['min_ms']:.3f} "
+            f"mean_ms={summary['mean_ms']:.3f} "
+            f"p95_ms={summary['p95_ms']:.3f} "
+            f"max_ms={summary['max_ms']:.3f} "
+            f"gt1ms={int(summary['gt1ms'])} "
+            f"gt2ms={int(summary['gt2ms'])} "
+            f"gt4ms={int(summary['gt4ms'])}"
+        )
+    lines.append("")
+    overall = _summarize_lateness_ms(all_values)
+    if overall is None:
+        lines.append("overall: no data")
+    else:
+        lines.append(
+            f"overall: count={int(overall['count'])} "
+            f"min_ms={overall['min_ms']:.3f} "
+            f"mean_ms={overall['mean_ms']:.3f} "
+            f"p95_ms={overall['p95_ms']:.3f} "
+            f"max_ms={overall['max_ms']:.3f} "
+            f"gt1ms={int(overall['gt1ms'])} "
+            f"gt2ms={int(overall['gt2ms'])} "
+            f"gt4ms={int(overall['gt4ms'])}"
+        )
+    (log_dir / "mouse_schedule_summary.txt").write_text("\n".join(lines) + "\n")
+
+
 def _run_mouse_flows(
     host,
     host_label: str,
@@ -456,11 +561,15 @@ def _run_mouse_flows(
     extra_args: List[str],
     heartbeat_interval: float = 10.0,
     run_label: str = "",
+    schedule_stats: Optional[Dict[str, object]] = None,
 ):
     seq = 0
     last_heartbeat = start_time
     has_duration = total_duration is not None
     prefix = f"{run_label} " if run_label else ""
+    if schedule_stats is not None:
+        schedule_stats["thread_start_s"] = time.monotonic()
+        schedule_stats.setdefault("lateness_ms", [])
     while not stop_event.is_set():
         now = time.monotonic()
         if now - last_heartbeat >= heartbeat_interval:
@@ -489,6 +598,10 @@ def _run_mouse_flows(
             break
         if has_duration and time.monotonic() >= start_time + total_duration:
             break
+
+        actual_time = time.monotonic()
+        if schedule_stats is not None:
+            schedule_stats["lateness_ms"].append((actual_time - send_time) * 1000.0)
 
         seq += 1
         csv_path = log_dir / f"mouse_client_{host_label}_{seq:04d}.csv"
@@ -601,6 +714,9 @@ def run_incast_once(
     mouse_stop = threading.Event()
     mouse_procs: List = []
     server_procs: List = []
+    mouse_schedule_stats: List[Dict[str, object]] = []
+    start_time: Optional[float] = None
+    grid_t0: Optional[float] = None
 
     try:
         ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=50)
@@ -718,6 +834,12 @@ def run_incast_once(
         grid_t0 = math.ceil((start_time + MOUSE_START_DELAY_S) / MOUSE_PERIOD_S) * MOUSE_PERIOD_S
         print(f"{run_tag} starting mouse generator threads for {len(mouse_clients)} hosts.")
         for mc in mouse_clients:
+            stats: Dict[str, object] = {
+                "host": mc.name,
+                "thread_start_s": None,
+                "lateness_ms": [],
+            }
+            mouse_schedule_stats.append(stats)
             thread = threading.Thread(
                 target=_run_mouse_flows,
                 args=(
@@ -731,9 +853,8 @@ def run_incast_once(
                     mouse_stop,
                     mouse_procs,
                     mouse_extra,
-                    10.0,
-                    run_tag,
                 ),
+                kwargs={"heartbeat_interval": 10.0, "run_label": run_tag, "schedule_stats": stats},
                 daemon=True,
             )
             thread.start()
@@ -781,6 +902,14 @@ def run_incast_once(
         for thread in mouse_threads:
             if thread.is_alive():
                 thread.join(timeout=3)
+        if (
+            start_time is not None
+            and grid_t0 is not None
+            and mouse_schedule_stats
+            and log_dir is not None
+        ):
+            _write_mouse_thread_start_log(log_dir, start_time, grid_t0, mouse_schedule_stats)
+            _write_mouse_schedule_summary(log_dir, start_time, grid_t0, mouse_schedule_stats)
         _terminate_processes(
             mouse_procs + [elephant_client_proc] + server_procs,
             term_timeout=kill_grace_seconds,
