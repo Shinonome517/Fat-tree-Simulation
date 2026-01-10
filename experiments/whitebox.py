@@ -15,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 from typing import List, Optional
+import os
 
 # Ensure the repository root is on sys.path when executed as a script.
 import sys
@@ -336,6 +337,40 @@ def _wait_for_completion_then_terminate(
             pass
 
 
+def _select_primary_intf(host) -> Optional[str]:
+    if not host:
+        return None
+    for intf in host.intfList():
+        name = getattr(intf, "name", None)
+        if name and name != "lo":
+            return name
+    return None
+
+
+def _read_host_tx_bytes(host, intf_name: str) -> Optional[int]:
+    if not host or not intf_name:
+        return None
+    raw = host.cmd(f"cat /sys/class/net/{intf_name}/statistics/tx_bytes 2>/dev/null").strip()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _write_elephant_measurement_csv(path: Path, duration: float, sent_bytes: Optional[int]) -> None:
+    """
+    Write a minimal perf-style CSV for the Elephant measurement window.
+
+    Only Duration/Sent are consumed by the analysis; other columns are kept for compatibility.
+    """
+    duration = max(float(duration), 0.0)
+    sent = max(int(sent_bytes or 0), 0)
+    mbps_s = (sent * 8 / duration) / 1e6 if duration > 0 else 0.0
+    header = "Log_v,PQ_v,Duration,Sent,Received,Mpbs_S,Mbps_R"
+    row = f"1,1,{duration:.6f},{sent},{0},{mbps_s:.6f},{0.0}"
+    path.write_text(f"{header}\n{row}\n")
+
+
 def _run_mouse_flows(
     host,
     host_label: str,
@@ -351,6 +386,7 @@ def _run_mouse_flows(
     mouse_lambda: float,
     heartbeat_interval: float = 10.0,
     run_label: str = "",
+    log_start_time: Optional[float] = None,
 ):
     seq = 0
     last_heartbeat = start_time
@@ -371,7 +407,10 @@ def _run_mouse_flows(
             break
 
         seq += 1
-        csv_path = log_dir / f"mouse_client_{host_label}_{seq:04d}.csv"
+        if log_start_time is not None and time.time() < log_start_time:
+            csv_path = Path(os.devnull)
+        else:
+            csv_path = log_dir / f"mouse_client_{host_label}_{seq:04d}.csv"
         size_bytes = random.randint(size_min, size_max)
         scenario = f"*1:{size_bytes}:0;"
         mouse_cmd = picoquic_perf_cmd(
@@ -492,12 +531,6 @@ def run_whitebox_once(
         mouse_client = ctx.net.get("h201")
         server_host = ctx.net.get("h311")
 
-        print(f"{run_tag} capturing switch stats (before).")
-        before_stats = snapshot_switch_bytes(ctx)
-        (log_dir / "switch_stats_before.json").write_text(
-            json.dumps(before_stats, indent=2)
-        )
-
         print(f"{run_tag} starting servers (elephant & mouse).")
         # Start picoquicdemo servers for Elephant and Mouse.
         elephant_server_log = log_dir / "elephant_server.log"
@@ -554,7 +587,9 @@ def run_whitebox_once(
         )
         print(f"{run_tag} health checks passed.")
 
-        total_duration = WARMUP_SECONDS + duration
+        warmup_duration = WARMUP_SECONDS
+        measurement_duration = duration
+        total_duration = warmup_duration + measurement_duration
         elephant_target_bytes = elephant_bytes
         if elephant_target_bytes is None:
             link_bps = DEFAULT_LINK_BW_MBPS * 1_000_000
@@ -563,7 +598,7 @@ def run_whitebox_once(
             raise ValueError("elephant_bytes must be positive when provided or computed.")
         elephant_scenario = f"*1:{elephant_target_bytes}:0;"
 
-        elephant_csv = log_dir / "elephant_client.csv"
+        elephant_csv_full = log_dir / "elephant_client_full.csv"
         elephant_extra = get_extra_args(proto, ROLE_ELEPHANT_CLIENT)
         print(
             f"{run_tag} starting elephant client "
@@ -572,7 +607,7 @@ def run_whitebox_once(
         elephant_cmd = picoquic_perf_cmd(
             server_ip=server_ip,
             server_port=ELEPHANT_PORT,
-            csv_path=elephant_csv,
+            csv_path=elephant_csv_full,
             scenario=elephant_scenario,
             extra_args=elephant_extra,
         )
@@ -581,6 +616,8 @@ def run_whitebox_once(
         mouse_extra = get_extra_args(proto, ROLE_MOUSE_CLIENT)
         start_time = time.time()
         print(f"{run_tag} starting mouse generator thread.")
+        measurement_start_time = start_time + warmup_duration
+        measurement_end_time = measurement_start_time + measurement_duration
         mouse_thread = threading.Thread(
             target=_run_mouse_flows,
             args=(
@@ -599,18 +636,46 @@ def run_whitebox_once(
                 10.0,
                 run_tag,
             ),
+            kwargs={"log_start_time": measurement_start_time},
             daemon=True,
         )
         mouse_thread.start()
 
         print(f"{run_tag} traffic running; warmup+duration={total_duration}s.")
-        time.sleep(total_duration)
+
+        # Warmup phase (traffic running, metrics not recorded).
+        now = time.time()
+        if measurement_start_time > now:
+            time.sleep(measurement_start_time - now)
+
+        print(f"{run_tag} capturing switch stats (before measurement).")
+        before_stats = snapshot_switch_bytes(ctx)
+        (log_dir / "switch_stats_before.json").write_text(
+            json.dumps(before_stats, indent=2)
+        )
+        ele_intf = _select_primary_intf(elephant_client)
+        ele_tx_before = _read_host_tx_bytes(elephant_client, ele_intf)
+
+        now = time.time()
+        if measurement_end_time > now:
+            time.sleep(measurement_end_time - now)
         mouse_stop.set()
         if mouse_thread:
             mouse_thread.join()
 
         _wait_for_completion_then_terminate(
             elephant_client_proc, wait_timeout=5, label=f"{run_tag} elephant client"
+        )
+
+        ele_tx_after = _read_host_tx_bytes(elephant_client, ele_intf)
+        elephant_measure_csv = log_dir / "elephant_client.csv"
+        ele_delta = None
+        if ele_tx_before is not None and ele_tx_after is not None:
+            ele_delta = ele_tx_after - ele_tx_before
+        else:
+            print(f"{run_tag} warning: unable to read elephant tx_bytes for measurement; writing 0 sent bytes.")
+        _write_elephant_measurement_csv(
+            elephant_measure_csv, measurement_duration, ele_delta
         )
 
         after_stats = snapshot_switch_bytes(ctx)
