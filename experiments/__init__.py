@@ -69,11 +69,15 @@ def make_log_dir(
     exp_kind: str,
     proto: str,
     log_root: Optional[Path] = None,
+    suffix: Optional[str] = None,
 ) -> Path:
     """Create and return a timestamped log directory for the given experiment."""
     ts = time.strftime("%Y%m%d-%H%M%S")
     base = Path(log_root) if log_root is not None else Path("logs") / exp_kind
-    path = base / proto / f"run_{ts}"
+    run_name = f"run_{ts}"
+    if suffix:
+        run_name = f"{run_name}_{suffix}"
+    path = base / proto / run_name
     path.mkdir(parents=True, exist_ok=True)
     return path
 

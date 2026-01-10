@@ -45,6 +45,7 @@ DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
 DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
 MOUSE_SIZE_MIN = 4 * 1024
 MOUSE_SIZE_MAX = 64 * 1024
+DEFAULT_MOUSE_LAMBDA = 80.0
 
 # TODO: Adjust server options (certs/logging/paths) for actual experiments.
 PICOQUIC_CERT_PATH = "/etc/picoquic/server-cert.pem"
@@ -343,6 +344,9 @@ def _run_mouse_flows(
     stop_event: threading.Event,
     proc_store: List,
     extra_args: List[str],
+    size_min: int,
+    size_max: int,
+    mouse_lambda: float,
     heartbeat_interval: float = 10.0,
     run_label: str = "",
 ):
@@ -357,7 +361,7 @@ def _run_mouse_flows(
         if now >= start_time + total_duration:
             break
 
-        sleep_time = random.expovariate(80.0)
+        sleep_time = random.expovariate(mouse_lambda)
         stop_event.wait(sleep_time)
         if stop_event.is_set():
             break
@@ -366,7 +370,7 @@ def _run_mouse_flows(
 
         seq += 1
         csv_path = log_dir / f"mouse_client_{host_label}_{seq:04d}.csv"
-        size_bytes = random.randint(MOUSE_SIZE_MIN, MOUSE_SIZE_MAX)
+        size_bytes = random.randint(size_min, size_max)
         scenario = f"*1:{size_bytes}:0;"
         mouse_cmd = picoquic_perf_cmd(
             server_ip=server_ip,
@@ -445,6 +449,9 @@ def run_whitebox_once(
     run_index: int,
     elephant_bytes: Optional[int],
     elephant_load_fraction: float,
+    mouse_size_min: int = MOUSE_SIZE_MIN,
+    mouse_size_max: int = MOUSE_SIZE_MAX,
+    mouse_lambda: float = DEFAULT_MOUSE_LAMBDA,
     total_runs: Optional[int] = None,
     enable_qlog: bool = False,
     output_subdir: Optional[Path] = None,
@@ -452,6 +459,10 @@ def run_whitebox_once(
     """Execute one whitebox experiment run."""
     seed = base_seed + run_index
     random.seed(seed)
+    if mouse_size_min <= 0 or mouse_size_max <= 0 or mouse_size_min > mouse_size_max:
+        raise ValueError("mouse_size_min/mouse_size_max must be positive and min <= max.")
+    if mouse_lambda <= 0:
+        raise ValueError("mouse_lambda must be positive.")
 
     run_tag = (
         f"[run {run_index + 1}/{total_runs}]" if total_runs is not None else f"[run {run_index + 1}]"
@@ -462,7 +473,7 @@ def run_whitebox_once(
     print(f"{run_tag} building topology...")
 
     log_root = Path("logs/whitebox") / (output_subdir or Path("default"))
-    log_dir = make_log_dir("whitebox", proto, log_root=log_root)
+    log_dir = make_log_dir("whitebox", proto, log_root=log_root, suffix=f"seed{seed}")
 
     ctx = None
     elephant_client_proc = None
@@ -580,6 +591,9 @@ def run_whitebox_once(
                 mouse_stop,
                 mouse_procs,
                 mouse_extra,
+                mouse_size_min,
+                mouse_size_max,
+                mouse_lambda,
                 10.0,
                 run_tag,
             ),
@@ -642,6 +656,24 @@ def main() -> None:
         help="If --elephant-bytes is unset, fraction of link capacity to target (default 0.7).",
     )
     parser.add_argument(
+        "--mouse-size-min",
+        type=int,
+        default=MOUSE_SIZE_MIN,
+        help="Mouse フローの最小ペイロードサイズ (bytes)。デフォルトは 4KB。",
+    )
+    parser.add_argument(
+        "--mouse-size-max",
+        type=int,
+        default=MOUSE_SIZE_MAX,
+        help="Mouse フローの最大ペイロードサイズ (bytes)。デフォルトは 64KB。",
+    )
+    parser.add_argument(
+        "--mouse-lambda",
+        type=float,
+        default=DEFAULT_MOUSE_LAMBDA,
+        help="Mouse フロー到着のポアソン分布パラメータ (flows/second)。デフォルト 80.0。",
+    )
+    parser.add_argument(
         "--enable-qlog",
         action="store_true",
         help="Enable picoquicdemo -l qlog capture for servers (default: disabled for performance).",
@@ -657,6 +689,9 @@ def main() -> None:
             run_index=run_idx,
             elephant_bytes=args.elephant_bytes,
             elephant_load_fraction=args.elephant_load_frac,
+            mouse_size_min=args.mouse_size_min,
+            mouse_size_max=args.mouse_size_max,
+            mouse_lambda=args.mouse_lambda,
             total_runs=args.runs,
             enable_qlog=args.enable_qlog,
             output_subdir=args.output_dir,
