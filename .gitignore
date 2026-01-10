@@ -216,3 +216,4 @@ logs/
 analysis/plots/
 analysis_test/
 *.bin
+run_all.sh

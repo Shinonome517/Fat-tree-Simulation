@@ -43,8 +43,10 @@ DEFAULT_SEED = 12345
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario (1 stream, 1KB each way)
 DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
 DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
-MOUSE_SIZE_MIN = 4 * 1024
-MOUSE_SIZE_MAX = 64 * 1024
+DEFAULT_MOUSE_SIZE_MIN_KB = 4
+DEFAULT_MOUSE_SIZE_MAX_KB = 64
+MOUSE_SIZE_MIN = DEFAULT_MOUSE_SIZE_MIN_KB * 1024
+MOUSE_SIZE_MAX = DEFAULT_MOUSE_SIZE_MAX_KB * 1024
 DEFAULT_MOUSE_LAMBDA = 80.0
 
 # TODO: Adjust server options (certs/logging/paths) for actual experiments.
@@ -658,14 +660,14 @@ def main() -> None:
     parser.add_argument(
         "--mouse-size-min",
         type=int,
-        default=MOUSE_SIZE_MIN,
-        help="Mouse フローの最小ペイロードサイズ (bytes)。デフォルトは 4KB。",
+        default=DEFAULT_MOUSE_SIZE_MIN_KB,
+        help="Mouse フローの最小ペイロードサイズ (KB)。デフォルトは 4KB。",
     )
     parser.add_argument(
         "--mouse-size-max",
         type=int,
-        default=MOUSE_SIZE_MAX,
-        help="Mouse フローの最大ペイロードサイズ (bytes)。デフォルトは 64KB。",
+        default=DEFAULT_MOUSE_SIZE_MAX_KB,
+        help="Mouse フローの最大ペイロードサイズ (KB)。デフォルトは 64KB。",
     )
     parser.add_argument(
         "--mouse-lambda",
@@ -680,6 +682,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    mouse_size_min_bytes = args.mouse_size_min * 1024
+    mouse_size_max_bytes = args.mouse_size_max * 1024
+
     for run_idx in range(args.runs):
         run_whitebox_once(
             proto=args.proto,
@@ -689,8 +694,8 @@ def main() -> None:
             run_index=run_idx,
             elephant_bytes=args.elephant_bytes,
             elephant_load_fraction=args.elephant_load_frac,
-            mouse_size_min=args.mouse_size_min,
-            mouse_size_max=args.mouse_size_max,
+            mouse_size_min=mouse_size_min_bytes,
+            mouse_size_max=mouse_size_max_bytes,
             mouse_lambda=args.mouse_lambda,
             total_runs=args.runs,
             enable_qlog=args.enable_qlog,
