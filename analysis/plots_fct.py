@@ -132,6 +132,99 @@ def plot_fct_cdf(
     plt.close(fig)
 
 
+def plot_fct_ccdf(
+    mouse_df: pd.DataFrame,
+    output_path: Path,
+    protos: Sequence[str],
+    *,
+    exclude_outliers: bool = False,
+    mark_outliers: bool = False,
+) -> None:
+    fig, ax = plt.subplots(figsize=(6, 4))
+    unit_label, scale = _resolve_fct_unit(exclude_outliers)
+    has_data = False
+    for proto in protos:
+        subset = mouse_df[mouse_df["proto"] == proto]
+        if subset.empty:
+            logging.warning("No mouse FCT data for %s", proto)
+            continue
+        values_all = subset["fct_s"].to_numpy()
+        if values_all.size == 0:
+            continue
+        if "had_retrans" in subset.columns:
+            had_retrans_all = subset["had_retrans"].to_numpy().astype(bool)
+        else:
+            had_retrans_all = np.zeros(values_all.shape, dtype=bool)
+        outlier_mask, lower, upper = _outlier_mask(values_all)
+        values = values_all[~outlier_mask] if exclude_outliers else values_all
+        if values.size == 0:
+            logging.warning("All mouse FCT values are outliers for %s", proto)
+            continue
+        values_sorted = np.sort(values * scale)
+        y = np.arange(len(values_sorted), 0, -1) / len(values_sorted)
+        (line,) = ax.step(values_sorted, y, where="post", label=proto)
+        color = line.get_color()
+        p50, p90, p99 = np.percentile(values * scale, [50, 90, 99])
+        ax.scatter(
+            [p50, p90, p99],
+            [0.5, 0.1, 0.01],
+            color=color,
+            marker="x",
+            s=25,
+            label=f"{proto} p50/p90/p99",
+        )
+        line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
+        if mark_outliers and not exclude_outliers and outlier_mask.any():
+            sort_idx = np.argsort(values_all)
+            values_sorted_all = values_all[sort_idx]
+            retrans_sorted = had_retrans_all[sort_idx]
+            y_all = np.arange(len(values_sorted_all), 0, -1) / len(values_sorted_all)
+            sorted_mask = (values_sorted_all < lower) | (values_sorted_all > upper)
+            outlier_y = y_all[sorted_mask]
+            outlier_values = values_sorted_all[sorted_mask] * scale
+            outlier_retrans = retrans_sorted[sorted_mask]
+            no_retrans_mask = ~outlier_retrans
+            has_retrans_mask = outlier_retrans
+            if np.any(no_retrans_mask):
+                ax.scatter(
+                    outlier_values[no_retrans_mask],
+                    outlier_y[no_retrans_mask],
+                    facecolors="none",
+                    edgecolors=color,
+                    marker="o",
+                    s=24,
+                    linewidth=1.0,
+                    label=f"{proto} outliers (no retrans)",
+                )
+            if np.any(has_retrans_mask):
+                ax.scatter(
+                    outlier_values[has_retrans_mask],
+                    outlier_y[has_retrans_mask],
+                    facecolors=color,
+                    edgecolors=color,
+                    marker="s",
+                    s=24,
+                    linewidth=0.8,
+                    label=f"{proto} outliers (retrans)",
+                )
+        has_data = True
+
+    if not has_data:
+        ax.text(0.5, 0.5, "No mouse data", ha="center", va="center")
+    else:
+        ax.set_xlabel(f"FCT ({unit_label})")
+        ax.set_ylabel("CCDF")
+        title = "Mouse FCT CCDF"
+        if exclude_outliers:
+            title += " (outliers removed, 1.5x IQR)"
+        ax.set_title(title)
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
 def plot_fct_histogram(
     mouse_df: pd.DataFrame,
     output_path: Path,

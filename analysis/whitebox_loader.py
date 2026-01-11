@@ -17,7 +17,9 @@ import pandas as pd
 from csv_utils import find_retrans_column, find_spurious_column, normalize_columns
 
 
-RUN_ID_PATTERN = re.compile(r"^run_\d{8}-\d{6}$")
+# Accept historical run IDs (run_YYYYMMDD-HHMMSS) and new ones with seed suffix
+# (run_YYYYMMDD-HHMMSS_seed12345).
+RUN_ID_PATTERN = re.compile(r"^run_\d{8}-\d{6}(?:_seed\d+)?$")
 PROGRESS_INTERVAL = 5
 
 
