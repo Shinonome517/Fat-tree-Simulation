@@ -19,7 +19,7 @@ from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
 from whitebox_loader import collect_all_data, select_run_dirs
 from whitebox_metrics import compute_fairness, write_summary
 from scatter import plot_run_p99_scatter
-from plots_fct import plot_fct_ccdf
+from plots_fct import plot_fct_cdf
 from plots_goodput import plot_goodput_bar
 from plots_link import plot_link_heatmap
 
@@ -180,15 +180,15 @@ def main() -> None:
         output_dir / "whitebox_goodput_bar.png",
         PROTO_ORDER,
     )
-    plot_fct_ccdf(
+    plot_fct_cdf(
         mouse_df,
-        output_dir / "whitebox_fct_ccdf.png",
+        output_dir / "whitebox_fct_cdf.png",
         PROTO_ORDER,
         mark_outliers=True,
     )
-    plot_fct_ccdf(
+    plot_fct_cdf(
         mouse_df,
-        output_dir / "whitebox_fct_ccdf_no_outliers.png",
+        output_dir / "whitebox_fct_cdf_no_outliers.png",
         PROTO_ORDER,
         exclude_outliers=True,
     )

@@ -64,7 +64,7 @@ def plot_fct_cdf(
             had_retrans_all = subset["had_retrans"].to_numpy().astype(bool)
         else:
             had_retrans_all = np.zeros(values_all.shape, dtype=bool)
-        outlier_mask, _, _ = _outlier_mask(values_all)
+        outlier_mask, lower, upper = _outlier_mask(values_all)
         values = values_all[~outlier_mask] if exclude_outliers else values_all
         if values.size == 0:
             logging.warning("All mouse FCT values are outliers for %s", proto)

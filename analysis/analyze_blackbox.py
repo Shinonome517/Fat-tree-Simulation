@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
 
 
-DEFAULT_LOG_ROOT = Path("./logs/blackbox")
+DEFAULT_LOG_ROOT = Path("./logs/blackbox/default")
 DEFAULT_OUTPUT_DIR = Path("./analysis/plots")
 PROTO_ORDER = ("quic", "mpquic")
 HEATMAP_MAX_IFACES = 20  # Limit for readability; trim if there are many ifaces.

@@ -25,6 +25,9 @@ from topology import stop_fattree_topology
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario
 DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
 DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
+DEFAULT_KILL_GRACE_SECONDS = 3.0  # grace before SIGKILL when stopping processes
+SERVER_IDLE_TIMEOUT_MS = 5000
+CONGESTION_CONTROL = "cubic"
 
 # Experiment parameters.
 ELEPHANT_PAIR_COUNT = 4
@@ -50,10 +53,11 @@ MOUSE_SERVER_CMD_TEMPLATE = (
 # Extra args for picoquicdemo perf mode.
 # Keep these aligned with experiments.whitebox get_extra_args for Elephant clients.
 ELEPHANT_ALT_ADDRS_MPQUIC = "10.0.0.6/2,10.0.0.7/2,10.0.0.8/2"  # TODO: validate against actual host IPs/ifindex.
-EXTRA_ARGS_QUIC = ""
-EXTRA_ARGS_MPQUIC = f"-M -A {ELEPHANT_ALT_ADDRS_MPQUIC}"
-# Mouse flows remain single-path; payload size is controlled via the scenario string.
-EXTRA_ARGS_MOUSE = ""
+ROLE_ELEPHANT_SERVER = "elephant-server"
+ROLE_ELEPHANT_CLIENT = "elephant-client"
+ROLE_MOUSE_SERVER = "mouse-server"
+ROLE_MOUSE_CLIENT = "mouse-client"
+ELEPHANT_MAX_WAIT_PAD_SECONDS = 60.0  # extra wait beyond duration before forcing elephant teardown
 
 
 def _format_extra_args(extra_args: Union[Iterable[str], str, None]) -> str:
@@ -95,6 +99,7 @@ def _start_picoquic_server(
         qlog_path = Path(f"{log_path}.qlog")
         args.extend(["-l", str(qlog_path)])
     args.extend(["-c", PICOQUIC_CERT_PATH, "-k", PICOQUIC_KEY_PATH])
+    args.extend(["-d", str(SERVER_IDLE_TIMEOUT_MS)])
     args.extend(_normalize_extra_args(extra_args))
 
     with log_path.open("w") as log_file:
@@ -117,7 +122,7 @@ def _verify_udp_servers(hosts: Iterable, port: int, label: str) -> None:
         )
 
 
-def _terminate_processes(procs: List[object]) -> None:
+def _terminate_processes(procs: List[object], term_timeout: float = DEFAULT_KILL_GRACE_SECONDS) -> None:
     for proc in procs:
         if not proc:
             continue
@@ -129,7 +134,7 @@ def _terminate_processes(procs: List[object]) -> None:
         if not proc:
             continue
         try:
-            proc.wait(timeout=3)
+            proc.wait(timeout=max(term_timeout, 0.0))
         except Exception:
             try:
                 proc.kill()
@@ -167,6 +172,32 @@ def _wait_for_completion_then_terminate(
             pass
 
 
+def get_extra_args(proto: str, role: str) -> List[str]:
+    """
+    Return picoquicdemo extra CLI arguments based on proto and role.
+
+    All roles enforce congestion control selection via -G. MPQUIC adds -M/-A
+    for Elephant roles; Mouse remains single-path.
+    """
+    proto = (proto or "").lower()
+    base_args: List[str] = []
+    if CONGESTION_CONTROL:
+        base_args = ["-G", CONGESTION_CONTROL]
+    if proto != "mpquic":
+        return base_args
+
+    if role == ROLE_ELEPHANT_SERVER:
+        return base_args + ["-M"]
+    if role == ROLE_ELEPHANT_CLIENT:
+        args: List[str] = base_args + ["-M"]
+        if ELEPHANT_ALT_ADDRS_MPQUIC:
+            args += ["-A", ELEPHANT_ALT_ADDRS_MPQUIC]
+        return args
+    if role in (ROLE_MOUSE_SERVER, ROLE_MOUSE_CLIENT):
+        return base_args
+    return base_args
+
+
 def _pick_random_pairs(hosts: Sequence, count: int) -> List[Tuple]:
     pairs: List[Tuple] = []
     if len(hosts) < 2:
@@ -186,19 +217,20 @@ def _mouse_generator(
     dst_ip: str,
     log_dir: Path,
     start_time: float,
-    total_duration: float,
+    total_duration: Optional[float],
     stop_event: threading.Event,
     proc_store: List[object],
+    extra_args: List[str],
     run_tag: str,
 ) -> None:
     """Poisson arrivals of short Mouse flows with periodic heartbeats."""
     seq = 0
     next_heartbeat = start_time + MOUSE_HEARTBEAT_INTERVAL
     prefix = f"{run_tag} " if run_tag else ""
-    end_time = start_time + total_duration
+    end_time = start_time + total_duration if total_duration is not None else None
     while not stop_event.is_set():
         now = time.time()
-        if now >= end_time:
+        if end_time is not None and now >= end_time:
             break
         if now >= next_heartbeat:
             print(
@@ -208,7 +240,7 @@ def _mouse_generator(
 
         sleep_time = random.expovariate(MOUSE_LAMBDA)
         stop_event.wait(sleep_time)
-        if stop_event.is_set() or time.time() >= end_time:
+        if stop_event.is_set() or (end_time is not None and time.time() >= end_time):
             break
 
         seq += 1
@@ -220,7 +252,7 @@ def _mouse_generator(
             server_port=MOUSE_PORT,
             csv_path=csv_path,
             scenario=scenario,
-            extra_args=EXTRA_ARGS_MOUSE,
+            extra_args=extra_args,
             as_list=True,
         )
         proc = src_host.popen(mouse_cmd, shell=False)
@@ -230,17 +262,11 @@ def _mouse_generator(
 
 
 def _elephant_client_extra(proto: str) -> List[str]:
-    proto = (proto or "").lower()
-    if proto == "mpquic":
-        return [a for a in EXTRA_ARGS_MPQUIC.split() if a]
-    return [a for a in EXTRA_ARGS_QUIC.split() if a]
+    return get_extra_args(proto, ROLE_ELEPHANT_CLIENT)
 
 
 def _elephant_server_extra(proto: str) -> List[str]:
-    proto = (proto or "").lower()
-    if proto == "mpquic":
-        return ["-M"]
-    return []
+    return get_extra_args(proto, ROLE_ELEPHANT_SERVER)
 
 
 def _healthcheck(
@@ -280,7 +306,10 @@ def _healthcheck(
     _log(f"[health:{label}] ping ->\n{ping_out.strip()}")
 
     # QUIC perf short run with correct extra args
-    client_extra = _elephant_client_extra(proto) if label == "elephant" else [a for a in EXTRA_ARGS_MOUSE.split() if a]
+    client_extra = get_extra_args(
+        proto,
+        ROLE_ELEPHANT_CLIENT if label == "elephant" else ROLE_MOUSE_CLIENT,
+    )
     extra_str = _format_extra_args(client_extra)
     hc_timeout = 10
     scenario = DEFAULT_SCENARIO
@@ -319,6 +348,7 @@ def run_blackbox_once(
     elephant_bytes: Optional[int],
     elephant_load_fraction: float,
     enable_qlog: bool = False,
+    output_subdir: Optional[Path] = None,
 ) -> None:
     """Execute one blackbox experiment run."""
     seed = base_seed + run_index
@@ -328,7 +358,8 @@ def run_blackbox_once(
         f"{run_tag} starting blackbox run (proto={proto}, k={k}, duration={duration}s, seed={seed})"
     )
 
-    log_dir = make_log_dir("blackbox", proto)
+    log_root = Path("logs/blackbox") / (output_subdir or Path("default"))
+    log_dir = make_log_dir("blackbox", proto, log_root=log_root)
 
     ctx = None
     server_procs: List[object] = []
@@ -336,6 +367,7 @@ def run_blackbox_once(
     mouse_threads: List[threading.Thread] = []
     mouse_proc_lists: List[List[object]] = []
     mouse_stop = threading.Event()
+    all_mouse_procs: List[object] = []
 
     try:
         ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=75)
@@ -386,7 +418,7 @@ def run_blackbox_once(
                     host,
                     MOUSE_PORT,
                     log_path,
-                    [],
+                    get_extra_args(proto, ROLE_MOUSE_SERVER),
                     enable_qlog,
                 )
             )
@@ -396,6 +428,7 @@ def run_blackbox_once(
 
         start_time = time.time()
         elephant_extra = _elephant_client_extra(proto)
+        mouse_extra = get_extra_args(proto, ROLE_MOUSE_CLIENT)
         elephant_target_bytes = elephant_bytes
         if elephant_target_bytes is None:
             link_bps = DEFAULT_LINK_BW_MBPS * 1_000_000
@@ -461,9 +494,10 @@ def run_blackbox_once(
                     dst_ip,
                     log_dir,
                     start_time,
-                    duration,
+                    None,
                     mouse_stop,
                     proc_list,
+                    mouse_extra,
                     run_tag,
                 ),
                 daemon=True,
@@ -471,13 +505,33 @@ def run_blackbox_once(
             mouse_threads.append(thread)
             thread.start()
 
-        print(f"{run_tag} traffic running for {duration}s.")
-        time.sleep(duration)
+        print(f"{run_tag} traffic running; waiting for elephant completion.")
+        elephant_deadline = start_time + duration + ELEPHANT_MAX_WAIT_PAD_SECONDS
+        while time.time() < elephant_deadline:
+            if all(proc.poll() is not None for proc in elephant_procs if proc):
+                break
+            time.sleep(0.5)
+        for idx, proc in enumerate(elephant_procs):
+            if not proc:
+                continue
+            if proc.poll() is not None:
+                print(f"{run_tag} elephant {idx:02d} exited with code {proc.returncode}.")
+                continue
+            print(
+                f"{run_tag} elephant {idx:02d} exceeded duration+{ELEPHANT_MAX_WAIT_PAD_SECONDS:.0f}s; sending SIGTERM."
+            )
+            _wait_for_completion_then_terminate(
+                proc,
+                wait_timeout=0.0,
+                label=f"{run_tag} elephant {idx:02d}",
+            )
+
         mouse_stop.set()
         for thread in mouse_threads:
             thread.join()
 
-        _terminate_processes(elephant_procs)
+        all_mouse_procs: List[object] = [proc for plist in mouse_proc_lists for proc in plist]
+        _terminate_processes(all_mouse_procs, term_timeout=DEFAULT_KILL_GRACE_SECONDS)
 
         after_stats = snapshot_switch_bytes(ctx)
         (log_dir / "switch_stats_after.json").write_text(
@@ -489,10 +543,11 @@ def run_blackbox_once(
         for thread in mouse_threads:
             if thread.is_alive():
                 thread.join(timeout=2)
-        all_mouse_procs: List[object] = [
-            proc for plist in mouse_proc_lists for proc in plist
-        ]
-        _terminate_processes(elephant_procs + server_procs + all_mouse_procs)
+        all_mouse_procs = [proc for plist in mouse_proc_lists for proc in plist]
+        _terminate_processes(
+            elephant_procs + server_procs + all_mouse_procs,
+            term_timeout=DEFAULT_KILL_GRACE_SECONDS,
+        )
         stop_fattree_topology(ctx)
         print(f"{run_tag} teardown complete.")
 
@@ -504,6 +559,15 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=4)
     parser.add_argument("--duration", type=float, default=180.0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("default"),
+        help=(
+            "Subdirectory name under logs/blackbox. Each run writes to "
+            "logs/blackbox/<output-dir>/<proto>/run_<timestamp> (default: default)."
+        ),
+    )
     parser.add_argument(
         "--elephant-bytes",
         type=int,
@@ -533,6 +597,7 @@ def main() -> None:
             elephant_bytes=args.elephant_bytes,
             elephant_load_fraction=args.elephant_load_frac,
             enable_qlog=args.enable_qlog,
+            output_subdir=args.output_dir,
         )
 
 
