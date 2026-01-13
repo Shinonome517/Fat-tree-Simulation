@@ -40,9 +40,11 @@ def write_summary(
     mouse_df: pd.DataFrame,
     fairness_df: pd.DataFrame,
     protos: Sequence[str],
+    *,
+    experiment_label: str = "Blackbox",
 ) -> None:
     lines: List[str] = []
-    lines.append("Blackbox Analysis Summary")
+    lines.append(f"{experiment_label} Analysis Summary")
     lines.append("=" * 30)
     lines.append("")
 
