@@ -31,7 +31,6 @@ from topology import host_ips, stop_fattree_topology
 
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario
 DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
-DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
 DEFAULT_KILL_GRACE_SECONDS = 3.0  # grace before SIGKILL when stopping processes
 SERVER_IDLE_TIMEOUT_MS = 5000
 CONGESTION_CONTROL = "cubic"
@@ -41,6 +40,9 @@ LOG_ROOT_NAME = "normal"
 TCP_PERF_PATH = Path(__file__).resolve().parent / "tcp_perf.py"
 PYTHON_BIN = "/usr/bin/python3"  # Use absolute python path inside Mininet hosts.
 LINK_SAMPLE_INTERVAL_S = 0.1
+WARMUP_SECONDS = 2.0
+DEFAULT_DURATION_SECONDS = 30.0
+DEFAULT_ELEPHANT_CONGESTION_RATE = 0.2  # fraction of 1 Gbps per Elephant flow
 
 # TCP short-flow survivability (λ=80 flows/s) – intentionally aggressive for the closed DCNW lab.
 TCP_SYSCTL_SETTINGS = {
@@ -52,13 +54,12 @@ TCP_SYSCTL_SETTINGS = {
 }
 
 # Experiment parameters.
-ELEPHANT_PAIR_COUNT = 4
-MOUSE_PAIR_COUNT = 20
+MOUSE_PAIR_COUNT = 10
 ELEPHANT_PORT = 4443
 MOUSE_PORT = 4444
-MOUSE_LAMBDA = 80.0
+MOUSE_TOTAL_LAMBDA = 160.0
 MOUSE_HEARTBEAT_INTERVAL = 10.0
-MOUSE_SIZE_MIN = 16 * 1024
+MOUSE_SIZE_MIN = 4 * 1024
 MOUSE_SIZE_MAX = 64 * 1024
 DEFAULT_SEED = 12345
 
@@ -74,7 +75,7 @@ MOUSE_SERVER_CMD_TEMPLATE = (
 
 # Extra args for picoquicdemo perf mode.
 # Keep these aligned with experiments.whitebox get_extra_args for Elephant clients.
-ELEPHANT_ALT_ADDRS_MPQUIC = ""  # Multipath address advertisement deferred for normal.py; keep single-path for now.
+ELEPHANT_ALT_ADDRS_MPQUIC = ""  # Multipath address advertisement is computed per host at runtime when using MPQUIC.
 ROLE_ELEPHANT_SERVER = "elephant-server"
 ROLE_ELEPHANT_CLIENT = "elephant-client"
 ROLE_MOUSE_SERVER = "mouse-server"
@@ -462,6 +463,7 @@ def _pick_random_pairs(
     count: int,
     src_pool: Optional[Sequence] = None,
     dst_pool: Optional[Sequence] = None,
+    rng: Optional[random.Random] = None,
 ) -> List[Tuple]:
     pairs: List[Tuple] = []
     if len(hosts) < 2:
@@ -470,16 +472,17 @@ def _pick_random_pairs(
     destinations = list(dst_pool) if dst_pool is not None else list(hosts)
     if not sources or not destinations:
         return pairs
+    rng = rng or random
     for _ in range(count):
-        src = random.choice(sources)
-        dst = random.choice(destinations)
+        src = rng.choice(sources)
+        dst = rng.choice(destinations)
         while dst == src and len(destinations) > 1:
-            dst = random.choice(destinations)
+            dst = rng.choice(destinations)
         pairs.append((src, dst))
     return pairs
 
 
-def _split_sender_pools(hosts: Sequence) -> Tuple[List, List]:
+def _split_sender_pools(hosts: Sequence, rng: Optional[random.Random] = None) -> Tuple[List, List]:
     """
     Split hosts into two non-empty, disjoint pools for Elephant/Mouse senders.
     Falls back to mixed use if hosts are insufficient.
@@ -487,9 +490,56 @@ def _split_sender_pools(hosts: Sequence) -> Tuple[List, List]:
     hosts_copy = list(hosts)
     if len(hosts_copy) < 2:
         return hosts_copy, hosts_copy
-    random.shuffle(hosts_copy)
+    (rng or random).shuffle(hosts_copy)
     mid = max(1, min(len(hosts_copy) - 1, len(hosts_copy) // 2))
     return hosts_copy[:mid], hosts_copy[mid:]
+
+
+def _pick_cross_pod_pairs(
+    hosts: Sequence,
+    count: int,
+    host_coord_map: Dict[object, Tuple[int, int, int]],
+    src_pool: Optional[Sequence] = None,
+    dst_pool: Optional[Sequence] = None,
+    rng: Optional[random.Random] = None,
+) -> List[Tuple]:
+    """
+    Select src/dst pairs such that src and dst belong to different pods.
+    Hosts may repeat across pairs.
+    """
+    pairs: List[Tuple] = []
+    if len(hosts) < 2 or not host_coord_map:
+        return pairs
+    rng = rng or random
+    src_by_pod: Dict[int, List[object]] = {}
+    dst_by_pod: Dict[int, List[object]] = {}
+    src_candidates = set(src_pool) if src_pool is not None else set(hosts)
+    dst_candidates = set(dst_pool) if dst_pool is not None else set(hosts)
+    for host, coords in host_coord_map.items():
+        pod_idx = coords[0]
+        if host in src_candidates:
+            src_by_pod.setdefault(pod_idx, []).append(host)
+        if host in dst_candidates:
+            dst_by_pod.setdefault(pod_idx, []).append(host)
+    src_pods = [p for p, hs in src_by_pod.items() if hs]
+    dst_pods = [p for p, hs in dst_by_pod.items() if hs]
+    if len(src_pods) < 1 or len(dst_pods) < 2:
+        return pairs
+
+    for _ in range(count):
+        src_pod = rng.choice(src_pods)
+        dst_pod_choices = [p for p in dst_pods if p != src_pod]
+        if not dst_pod_choices:
+            break
+        dst_pod = rng.choice(dst_pod_choices)
+        src_hosts = src_by_pod.get(src_pod, [])
+        dst_hosts = dst_by_pod.get(dst_pod, [])
+        if not src_hosts or not dst_hosts:
+            continue
+        src = rng.choice(src_hosts)
+        dst = rng.choice(dst_hosts)
+        pairs.append((src, dst))
+    return pairs
 
 
 def _mouse_generator(
@@ -504,6 +554,8 @@ def _mouse_generator(
     extra_args: List[str],
     proto: str,
     run_tag: str,
+    pair_lambda: float,
+    rng: random.Random,
 ) -> None:
     """Poisson arrivals of short Mouse flows with periodic heartbeats."""
     seq = 0
@@ -520,13 +572,15 @@ def _mouse_generator(
             )
             next_heartbeat += MOUSE_HEARTBEAT_INTERVAL
 
-        sleep_time = random.expovariate(MOUSE_LAMBDA)
+        if pair_lambda <= 0:
+            break
+        sleep_time = rng.expovariate(pair_lambda)
         stop_event.wait(sleep_time)
         if stop_event.is_set() or (end_time is not None and time.time() >= end_time):
             break
 
         seq += 1
-        size_bytes = random.randint(MOUSE_SIZE_MIN, MOUSE_SIZE_MAX)
+        size_bytes = rng.randint(MOUSE_SIZE_MIN, MOUSE_SIZE_MAX)
         csv_path = log_dir / f"mouse_{pair_index:02d}_{seq:04d}.csv"
         if proto in ("quic", "mpquic"):
             scenario = f"*1:{size_bytes}:0;"
@@ -661,17 +715,18 @@ def run_normal_once(
     base_seed: int,
     run_index: int,
     elephant_bytes: Optional[int],
-    elephant_load_fraction: float,
+    elephant_congestion_rate: float,
+    elephant_num: int,
     enable_qlog: bool = False,
     output_subdir: Optional[Path] = None,
     role_mode: str = "mixed",
 ) -> None:
     """Execute one normal experiment run."""
     seed = base_seed + run_index
-    random.seed(seed)
+    rng = random.Random(seed)
     run_tag = f"[run{run_index:04d}]"
     print(
-        f"{run_tag} starting normal run (proto={proto}, k={k}, duration={duration}s, seed={seed})"
+        f"{run_tag} starting normal run (proto={proto}, k={k}, duration={duration}s, seed={seed}, E={elephant_num}, C={elephant_congestion_rate})"
     )
 
     log_root = Path("logs") / LOG_ROOT_NAME / (output_subdir or Path("default"))
@@ -687,52 +742,71 @@ def run_normal_once(
     link_sampler: Optional[LinkSampler] = None
 
     try:
-        ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=75)
+        ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=50)
         hosts_flat = [h for pod in ctx.hosts for edge in pod for h in edge]
         print(f"{run_tag} hosts ready: {len(hosts_flat)} total.")
         _apply_tcp_sysctls(hosts_flat, proto)
 
-        print(f"{run_tag} capturing switch stats (before).")
-        before_stats = snapshot_switch_bytes(ctx)
-        (log_dir / "switch_stats_before.json").write_text(
-            json.dumps(before_stats, indent=2)
-        )
-        link_sampler = LinkSampler(
-            ctx,
-            log_dir=log_dir,
-            bw_mbps=DEFAULT_LINK_BW_MBPS,
-            run_tag=run_tag,
-            interval_s=LINK_SAMPLE_INTERVAL_S,
-        )
-        link_sampler.start()
-
         if role_mode not in ROLE_MODE_CHOICES:
             raise ValueError(f"role_mode must be one of {ROLE_MODE_CHOICES}")
         if role_mode == "split":
-            ele_src_pool, mouse_src_pool = _split_sender_pools(hosts_flat)
+            ele_src_pool, mouse_src_pool = _split_sender_pools(hosts_flat, rng=rng)
             if not ele_src_pool or not mouse_src_pool:
                 print(f"{run_tag} warning: unable to split sender pools; falling back to mixed.")
                 ele_src_pool = mouse_src_pool = hosts_flat
         else:
             ele_src_pool = mouse_src_pool = hosts_flat
 
-        elephant_pairs = _pick_random_pairs(hosts_flat, ELEPHANT_PAIR_COUNT, src_pool=ele_src_pool)
-        mouse_pairs = _pick_random_pairs(hosts_flat, MOUSE_PAIR_COUNT, src_pool=mouse_src_pool)
+        host_coord_map = _build_host_coord_map(ctx)
+
+        elephant_pairs = _pick_cross_pod_pairs(
+            hosts_flat,
+            elephant_num,
+            host_coord_map,
+            src_pool=ele_src_pool,
+            dst_pool=hosts_flat,
+            rng=rng,
+        )
+        if len(elephant_pairs) < elephant_num:
+            print(
+                f"{run_tag} warning: cross-pod elephant selection yielded {len(elephant_pairs)} pairs; falling back to random."
+            )
+            elephant_pairs = _pick_random_pairs(
+                hosts_flat, elephant_num, src_pool=ele_src_pool, rng=rng
+            )
+
+        mouse_pairs = _pick_cross_pod_pairs(
+            hosts_flat,
+            MOUSE_PAIR_COUNT,
+            host_coord_map,
+            src_pool=mouse_src_pool,
+            dst_pool=hosts_flat,
+            rng=rng,
+        )
+        if len(mouse_pairs) < MOUSE_PAIR_COUNT:
+            print(
+                f"{run_tag} warning: cross-pod mouse selection yielded {len(mouse_pairs)} pairs; falling back to random."
+            )
+            mouse_pairs = _pick_random_pairs(
+                hosts_flat, MOUSE_PAIR_COUNT, src_pool=mouse_src_pool, rng=rng
+            )
+
         print(
             f"{run_tag} selected pairs: elephants={len(elephant_pairs)}, mice={len(mouse_pairs)}"
         )
 
+        mouse_lambda_per_pair = MOUSE_TOTAL_LAMBDA / len(mouse_pairs) if mouse_pairs else 0.0
+
         # Persist pair selection to ease debugging when flows fail.
         pair_log = log_dir / "pair_map.txt"
         with pair_log.open("w") as f:
+            f.write(f"Total mouse lambda: {MOUSE_TOTAL_LAMBDA} flows/s, per-pair lambda: {mouse_lambda_per_pair:.3f} flows/s\n\n")
             f.write("Elephant pairs (src -> dst):\n")
             for idx, (src, dst) in enumerate(elephant_pairs):
                 f.write(f"{idx:02d}: {src.name} -> {dst.name} (dst_ip={dst.IP()})\n")
             f.write("\nMouse pairs (src -> dst):\n")
             for idx, (src, dst) in enumerate(mouse_pairs):
                 f.write(f"{idx:02d}: {src.name} -> {dst.name} (dst_ip={dst.IP()})\n")
-
-        host_coord_map = _build_host_coord_map(ctx)
         elephant_senders = {src for src, _ in elephant_pairs}
         elephant_iface_map: Dict[object, Optional[str]] = {}
         elephant_alt_map: Dict[object, str] = {}
@@ -811,17 +885,18 @@ def run_normal_once(
                 debug = {h.name: h.cmd("pgrep -fa tcp_perf.py || true") for h in elephant_server_hosts}
                 raise RuntimeError(f"tcp servers not listening after retries; pgrep={debug}")
 
-        start_time = time.time()
         mouse_extra = (
             get_extra_args(mouse_proto, ROLE_MOUSE_CLIENT) if mouse_proto in ("quic", "mpquic") else []
         )
         elephant_target_bytes = elephant_bytes
         if elephant_target_bytes is None:
             link_bps = DEFAULT_LINK_BW_MBPS * 1_000_000
-            elephant_target_bytes = int(elephant_load_fraction * link_bps / 8 * duration)
+            elephant_target_bytes = int(elephant_congestion_rate * link_bps / 8 * duration)
         if elephant_target_bytes <= 0:
             raise ValueError("elephant_bytes must be positive when provided or computed.")
         elephant_scenario = f"*1:{elephant_target_bytes}:0;" if proto in ("quic", "mpquic") else None
+        with (log_dir / "pair_map.txt").open("a") as f:
+            f.write(f"\nElephant target bytes per flow: {elephant_target_bytes} (C={elephant_congestion_rate})\n")
 
         # Pre-flight health checks on one elephant pair and one mouse pair (if present)
         if elephant_pairs:
@@ -849,6 +924,26 @@ def run_normal_once(
                 log_dir=log_dir,
                 run_tag=run_tag,
             )
+
+        link_sampler = LinkSampler(
+            ctx,
+            log_dir=log_dir,
+            bw_mbps=DEFAULT_LINK_BW_MBPS,
+            run_tag=run_tag,
+            interval_s=LINK_SAMPLE_INTERVAL_S,
+        )
+
+        print(f"{run_tag} warming up for {WARMUP_SECONDS}s.")
+        time.sleep(WARMUP_SECONDS)
+
+        print(f"{run_tag} capturing switch stats (before measurement).")
+        before_stats = snapshot_switch_bytes(ctx)
+        (log_dir / "switch_stats_before.json").write_text(
+            json.dumps(before_stats, indent=2)
+        )
+        link_sampler.start()
+
+        start_time = time.time()
 
         print(f"{run_tag} starting elephant clients.")
         for idx, (src, dst) in enumerate(elephant_pairs):
@@ -886,6 +981,7 @@ def run_normal_once(
             dst_ip = dst.IP()
             proc_list: List[object] = []
             mouse_proc_lists.append(proc_list)
+            mouse_rng = random.Random(seed + 1000 + idx)
             thread = threading.Thread(
                 target=_mouse_generator,
                 args=(
@@ -900,6 +996,8 @@ def run_normal_once(
                     mouse_extra,
                     mouse_proto,
                     run_tag,
+                    mouse_lambda_per_pair,
+                    mouse_rng,
                 ),
                 daemon=True,
             )
@@ -962,7 +1060,7 @@ def main() -> None:
     parser.add_argument("--proto", required=True, choices=list(PROTO_CHOICES))
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--k", type=int, default=4)
-    parser.add_argument("--duration", type=float, default=180.0)
+    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION_SECONDS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--output-dir",
@@ -980,10 +1078,16 @@ def main() -> None:
         help="Total payload bytes per Elephant perf scenario; overrides auto-sizing.",
     )
     parser.add_argument(
-        "--elephant-load-frac",
+        "--congestion-rate",
         type=float,
-        default=DEFAULT_ELEPHANT_LOAD_FRAC,
-        help="If --elephant-bytes is unset, fraction of link capacity to target per Elephant flow (default 0.7).",
+        default=DEFAULT_ELEPHANT_CONGESTION_RATE,
+        help="If --elephant-bytes is unset, per-Elephant target load as a fraction of 1 Gbps (default 0.2).",
+    )
+    parser.add_argument(
+        "--elephant-num",
+        type=int,
+        default=4,
+        help="Number of Elephant flows to launch (default 4).",
     )
     parser.add_argument(
         "--enable-qlog",
@@ -1006,7 +1110,8 @@ def main() -> None:
             base_seed=args.seed,
             run_index=run_idx,
             elephant_bytes=args.elephant_bytes,
-            elephant_load_fraction=args.elephant_load_frac,
+            elephant_congestion_rate=args.congestion_rate,
+            elephant_num=args.elephant_num,
             enable_qlog=args.enable_qlog,
             output_subdir=args.output_dir,
             role_mode=args.role_mode,
