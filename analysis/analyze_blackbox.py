@@ -9,10 +9,11 @@ comparison plots and a text summary.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
+import re
+import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import matplotlib
 import numpy as np
@@ -23,48 +24,66 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
+from plots_link import plot_link_heatmap
+from scatter import plot_run_p99_scatter
 
 
-DEFAULT_LOG_ROOT = Path("./logs/blackbox/default")
-DEFAULT_OUTPUT_DIR = Path("./analysis/plots")
+LOG_ROOT_BASE = Path("./logs/blackbox")
+DEFAULT_LOG_DIR_NAME = Path("default")
+OUTPUT_ROOT = Path("./analysis/plots/black")
 PROTO_ORDER = ("quic", "mpquic")
-HEATMAP_MAX_IFACES = 20  # Limit for readability; trim if there are many ifaces.
+MOUSE_DROPLOSS_FILENAME = "blackbox_mouse_droploss_ratio.png"
+MOUSE_RETRANS_FILENAME = "blackbox_mouse_retrans_ratio.png"
+RUN_ID_PATTERN = re.compile(r"^run_\d{8}-\d{6}(?:_seed\d+)?$")
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid integer: {value}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Value must be a positive integer.")
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze blackbox experiment logs.")
     parser.add_argument(
-        "--log-root",
+        "--log-dir",
+        dest="log_dir_name",
         type=Path,
-        default=DEFAULT_LOG_ROOT,
-        help="Root directory containing per-proto run_* subdirectories.",
+        default=DEFAULT_LOG_DIR_NAME,
+        help="Directory name under logs/blackbox to analyze (default: default).",
     )
     parser.add_argument(
         "--output-dir",
+        dest="output_dir_name",
         type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory to write plots and summary text.",
-    )
-    parser.add_argument(
-        "--output-subdir",
-        type=Path,
-        help=(
-            "Optional subdirectory name; outputs go to <output-dir>/black/<name>. "
-            "Default subdir: default."
-        ),
+        default=Path("default"),
+        help="Output subdirectory name under analysis/plots/black (default: default).",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging.",
     )
-    parser.add_argument(
+    run_select = parser.add_mutually_exclusive_group()
+    run_select.add_argument(
         "--run-id",
         action="append",
         help=(
-            "Run ID(s) to include (e.g., run_20251202-074952). "
+            "Run ID(s) to include (e.g., run_20251202-074952_seed123). "
             "Can be specified multiple times. "
             "Default: use the latest run_* per protocol."
+        ),
+    )
+    run_select.add_argument(
+        "--latest-n",
+        type=_positive_int,
+        help=(
+            "Select the latest N run_* per protocol. "
+            "Requires at least N runs for each protocol."
         ),
     )
     parser.add_argument(
@@ -95,25 +114,41 @@ def list_run_dirs(log_root: Path, proto: str) -> List[Path]:
     if not proto_dir.is_dir():
         logging.warning("Protocol path is not a directory: %s", proto_dir)
         return []
-    return sorted(
-        [d for d in proto_dir.iterdir() if d.is_dir() and d.name.startswith("run_")]
-    )
+    run_dirs: List[Path] = []
+    for entry in proto_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        if not entry.name.startswith("run_"):
+            continue
+        if not RUN_ID_PATTERN.match(entry.name):
+            logging.warning("Ignoring run dir with unexpected name: %s", entry)
+            continue
+        run_dirs.append(entry)
+    return sorted(run_dirs, key=lambda path: path.name)
 
 
 def select_run_dirs(
-    log_root: Path, protos: Sequence[str], run_ids: Sequence[str] | None
+    log_root: Path,
+    protos: Sequence[str],
+    run_ids: Sequence[str] | None,
+    latest_n: int | None,
 ) -> Dict[str, List[Path]]:
+    if run_ids and latest_n is not None:
+        raise ValueError("Cannot combine --run-id with --latest-n.")
     run_dirs_by_proto: Dict[str, List[Path]] = {}
     for proto in protos:
         available = list_run_dirs(log_root, proto)
+        if latest_n is not None and len(available) < latest_n:
+            raise ValueError(
+                f"Need at least {latest_n} run(s) for {proto} under {log_root}, "
+                f"found {len(available)}."
+            )
         if not available:
             logging.warning("No run_* directories found for %s under %s", proto, log_root)
             run_dirs_by_proto[proto] = []
             continue
 
-        if not run_ids:
-            selected = available[-1:]
-        else:
+        if run_ids:
             available_by_name = {d.name: d for d in available}
             selected = []
             for rid in run_ids:
@@ -122,6 +157,10 @@ def select_run_dirs(
                     selected.append(path)
                 else:
                     logging.warning("Requested run_id %s not found under %s", rid, proto)
+        elif latest_n is not None:
+            selected = available[-latest_n:]
+        else:
+            selected = available[-1:]
         run_dirs_by_proto[proto] = selected
     return run_dirs_by_proto
 
@@ -134,6 +173,13 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _find_retrans_column(columns: Sequence[str]) -> str | None:
     for name in ("retrans.", "retrans", "retransmissions", "retransmission"):
+        if name in columns:
+            return name
+    return None
+
+
+def _find_spurious_column(columns: Sequence[str]) -> str | None:
+    for name in ("spurious", "spurious retransmissions"):
         if name in columns:
             return name
     return None
@@ -200,13 +246,28 @@ def load_mouse_fcts(csv_path: Path) -> List[Dict[str, object]]:
     if valid.sum() == 0:
         return []
     retrans_col = _find_retrans_column(df.columns)
+    spurious_col = _find_spurious_column(df.columns)
     if retrans_col is None:
         retrans_vals = pd.Series(0, index=df.index, dtype=float)
     else:
         retrans_vals = pd.to_numeric(df[retrans_col], errors="coerce").fillna(0)
+    if spurious_col is None:
+        spurious_vals = pd.Series(0, index=df.index, dtype=float)
+    else:
+        spurious_vals = pd.to_numeric(df[spurious_col], errors="coerce").fillna(0)
+
+    drop_retrans = (retrans_vals - spurious_vals).clip(lower=0)
     rows: List[Dict[str, object]] = []
-    for duration, retrans in zip(durations[valid], retrans_vals[valid]):
-        rows.append({"fct_s": float(duration), "had_retrans": bool(float(retrans) > 0)})
+    for duration, retrans, drop in zip(
+        durations[valid], retrans_vals[valid], drop_retrans[valid]
+    ):
+        rows.append(
+            {
+                "fct_s": float(duration),
+                "had_retrans": bool(float(retrans) > 0),
+                "had_drop_retrans": bool(float(drop) > 0),
+            }
+        )
     return rows
 
 
@@ -317,9 +378,16 @@ def collect_all_data(
                     }
                 )
 
-    elephant_df = pd.DataFrame(elephant_rows)
-    mouse_df = pd.DataFrame(mouse_rows)
-    link_df = pd.DataFrame(link_rows)
+    elephant_df = pd.DataFrame(
+        elephant_rows, columns=["proto", "run_id", "pair_id", "goodput_mbps"]
+    )
+    mouse_df = pd.DataFrame(
+        mouse_rows,
+        columns=["proto", "run_id", "pair_id", "fct_s", "had_retrans", "had_drop_retrans"],
+    )
+    link_df = pd.DataFrame(
+        link_rows, columns=["proto", "run_id", "if_name", "delta_tx_bytes"]
+    )
     return {"elephant": elephant_df, "mouse": mouse_df, "link": link_df}
 
 
@@ -637,46 +705,6 @@ def plot_mouse_fct_histogram(
     plt.close(fig)
 
 
-def plot_link_heatmap(
-    link_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
-) -> None:
-    if link_df.empty:
-        fig, ax = plt.subplots(figsize=(6, 3))
-        ax.text(0.5, 0.5, "No link data", ha="center", va="center")
-        ax.axis("off")
-        fig.tight_layout()
-        fig.savefig(output_path, dpi=200)
-        plt.close(fig)
-        return
-
-    pivot = (
-        link_df.groupby(["if_name", "proto"])["delta_tx_bytes"]
-        .mean()
-        .unstack(fill_value=0.0)
-    )
-    pivot = pivot[[p for p in protos if p in pivot.columns]]
-
-    if len(pivot) > HEATMAP_MAX_IFACES:
-        total = pivot.sum(axis=1).sort_values(ascending=False)
-        keep = total.head(HEATMAP_MAX_IFACES).index
-        pivot = pivot.loc[keep]
-
-    fig, ax = plt.subplots(
-        figsize=(6, max(3.0, 0.35 * len(pivot.index)))
-    )
-    im = ax.imshow(pivot.values, aspect="auto", cmap="viridis")
-    ax.set_xticks(np.arange(pivot.shape[1]))
-    ax.set_xticklabels(pivot.columns)
-    ax.set_yticks(np.arange(pivot.shape[0]))
-    ax.set_yticklabels(pivot.index)
-    ax.set_title("Switch delta TX bytes (avg)")
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Bytes")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-
 def write_summary(
     output_path: Path,
     elephant_df: pd.DataFrame,
@@ -740,17 +768,26 @@ def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
 
-    output_subdir = args.output_subdir or Path("default")
-    output_dir: Path = args.output_dir / "black" / output_subdir
+    output_dir: Path = OUTPUT_ROOT / args.output_dir_name
     output_dir.mkdir(parents=True, exist_ok=True)
     logging.info("Writing outputs to %s", output_dir)
 
-    run_dirs_by_proto = select_run_dirs(args.log_root, PROTO_ORDER, args.run_id)
+    log_root = LOG_ROOT_BASE / args.log_dir_name
+    try:
+        run_dirs_by_proto = select_run_dirs(
+            log_root,
+            PROTO_ORDER,
+            args.run_id,
+            args.latest_n,
+        )
+    except ValueError as exc:
+        logging.error("%s", exc)
+        raise SystemExit(1) from exc
     total_runs = sum(len(v) for v in run_dirs_by_proto.values())
     if total_runs == 0:
         logging.error(
             "No run directories selected under %s for protocols: %s",
-            args.log_root,
+            log_root,
             ", ".join(PROTO_ORDER),
         )
         return
@@ -767,7 +804,13 @@ def main() -> None:
         else:
             logging.warning("No runs selected for %s", proto)
 
-    data = collect_all_data(args.log_root, PROTO_ORDER, run_dirs_by_proto)
+    run_list: List[Tuple[str, Path]] = [
+        (f"{proto}:{run_dir.name}", run_dir)
+        for proto in PROTO_ORDER
+        for run_dir in run_dirs_by_proto.get(proto, [])
+    ]
+
+    data = collect_all_data(log_root, PROTO_ORDER, run_dirs_by_proto)
     elephant_df = data["elephant"]
     mouse_df = data["mouse"]
     link_df = data["link"]
@@ -798,6 +841,11 @@ def main() -> None:
         output_dir / "blackbox_mouse_fct_cdf_no_outliers.png",
         PROTO_ORDER,
         exclude_outliers=True,
+    )
+    plot_run_p99_scatter(
+        mouse_df,
+        output_dir / "blackbox_mouse_p99_scatter.png",
+        PROTO_ORDER,
     )
     plot_mouse_fct_histogram(
         mouse_df,
@@ -832,6 +880,94 @@ def main() -> None:
         fairness_df,
         PROTO_ORDER,
     )
+
+    if not run_list:
+        logging.warning("No runs available; skipping mouse drop/retrans plots.")
+        return
+
+    try:
+        import analysis.mouse_droploss_plot as droploss
+        import analysis.mouse_retrans_plot as retrans
+    except ImportError:  # pragma: no cover - support script execution
+        import mouse_droploss_plot as droploss
+        import mouse_retrans_plot as retrans
+
+    def _subset_mouse(mouse_df: pd.DataFrame, proto: str) -> pd.DataFrame:
+        if "proto" not in mouse_df.columns:
+            return mouse_df.iloc[0:0]
+        return mouse_df[mouse_df["proto"] == proto]
+
+    def _count_true(subset: pd.DataFrame, column: str) -> int:
+        if column not in subset.columns:
+            return 0
+        return int(subset[column].fillna(False).astype(bool).sum())
+
+    droploss_summaries: List[droploss.DropLossSummary] = []
+    for proto in PROTO_ORDER:
+        runs = run_dirs_by_proto.get(proto, [])
+        if not runs:
+            continue
+        subset = _subset_mouse(mouse_df, proto)
+        drop_flows = _count_true(subset, "had_drop_retrans")
+        droploss_summaries.append(
+            droploss.DropLossSummary(
+                label=proto,
+                run_dir=runs[-1],
+                drop_flows=drop_flows,
+                total_flows=len(subset),
+            )
+        )
+    if droploss_summaries:
+        droploss_path = droploss.plot_drop_retrans_ratios(
+            droploss_summaries,
+            output_dir=output_dir,
+            filename=MOUSE_DROPLOSS_FILENAME,
+            title="Mouse drop-induced retransmissions",
+        )
+        drop_flows = sum(s.drop_flows for s in droploss_summaries)
+        total_flows = sum(s.total_flows for s in droploss_summaries)
+        logging.info(
+            "Wrote drop-loss plot to %s (drop-induced retrans flows: %d/%d).",
+            droploss_path,
+            drop_flows,
+            total_flows,
+        )
+    else:
+        logging.warning("No runs available for drop-loss plot.")
+
+    retrans_summaries: List[retrans.RetransSummary] = []
+    for proto in PROTO_ORDER:
+        runs = run_dirs_by_proto.get(proto, [])
+        if not runs:
+            continue
+        subset = _subset_mouse(mouse_df, proto)
+        retrans_flows = _count_true(subset, "had_retrans")
+        retrans_summaries.append(
+            retrans.RetransSummary(
+                label=proto,
+                run_dir=runs[-1],
+                retrans_flows=retrans_flows,
+                total_flows=len(subset),
+            )
+        )
+
+    if retrans_summaries:
+        retrans_path = retrans.plot_retrans_ratios(
+            retrans_summaries,
+            output_dir=output_dir,
+            filename=MOUSE_RETRANS_FILENAME,
+            title="Mouse retransmission ratio",
+        )
+        retrans_flows = sum(s.retrans_flows for s in retrans_summaries)
+        total_flows = sum(s.total_flows for s in retrans_summaries)
+        logging.info(
+            "Wrote retrans plot to %s (flows with retrans: %d/%d).",
+            retrans_path,
+            retrans_flows,
+            total_flows,
+        )
+    else:
+        logging.warning("No runs available for retrans plot.")
 
 
 if __name__ == "__main__":

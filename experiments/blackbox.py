@@ -359,7 +359,7 @@ def run_blackbox_once(
     )
 
     log_root = Path("logs/blackbox") / (output_subdir or Path("default"))
-    log_dir = make_log_dir("blackbox", proto, log_root=log_root)
+    log_dir = make_log_dir("blackbox", proto, log_root=log_root, suffix=f"seed{seed}")
 
     ctx = None
     server_procs: List[object] = []
@@ -565,7 +565,7 @@ def main() -> None:
         default=Path("default"),
         help=(
             "Subdirectory name under logs/blackbox. Each run writes to "
-            "logs/blackbox/<output-dir>/<proto>/run_<timestamp> (default: default)."
+            "logs/blackbox/<output-dir>/<proto>/run_<timestamp>_seed<seed> (default: default)."
         ),
     )
     parser.add_argument(
