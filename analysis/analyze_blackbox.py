@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
@@ -26,6 +24,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
 from plots_link import plot_link_heatmap
 from scatter import plot_run_p99_scatter
+from blackbox_loader import collect_all_data, select_run_dirs
+from blackbox_metrics import compute_fairness, write_summary
 
 
 LOG_ROOT_BASE = Path("./logs/blackbox")
@@ -34,7 +34,6 @@ OUTPUT_ROOT = Path("./analysis/plots/black")
 PROTO_ORDER = ("quic", "mpquic")
 MOUSE_DROPLOSS_FILENAME = "blackbox_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "blackbox_mouse_retrans_ratio.png"
-RUN_ID_PATTERN = re.compile(r"^run_\d{8}-\d{6}(?:_seed\d+)?$")
 
 
 def _positive_int(value: str) -> int:
@@ -104,313 +103,6 @@ def parse_args() -> argparse.Namespace:
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
-
-
-def list_run_dirs(log_root: Path, proto: str) -> List[Path]:
-    proto_dir = log_root / proto
-    if not proto_dir.exists():
-        logging.warning("Protocol directory not found: %s", proto_dir)
-        return []
-    if not proto_dir.is_dir():
-        logging.warning("Protocol path is not a directory: %s", proto_dir)
-        return []
-    run_dirs: List[Path] = []
-    for entry in proto_dir.iterdir():
-        if not entry.is_dir():
-            continue
-        if not entry.name.startswith("run_"):
-            continue
-        if not RUN_ID_PATTERN.match(entry.name):
-            logging.warning("Ignoring run dir with unexpected name: %s", entry)
-            continue
-        run_dirs.append(entry)
-    return sorted(run_dirs, key=lambda path: path.name)
-
-
-def select_run_dirs(
-    log_root: Path,
-    protos: Sequence[str],
-    run_ids: Sequence[str] | None,
-    latest_n: int | None,
-) -> Dict[str, List[Path]]:
-    if run_ids and latest_n is not None:
-        raise ValueError("Cannot combine --run-id with --latest-n.")
-    run_dirs_by_proto: Dict[str, List[Path]] = {}
-    for proto in protos:
-        available = list_run_dirs(log_root, proto)
-        if latest_n is not None and len(available) < latest_n:
-            raise ValueError(
-                f"Need at least {latest_n} run(s) for {proto} under {log_root}, "
-                f"found {len(available)}."
-            )
-        if not available:
-            logging.warning("No run_* directories found for %s under %s", proto, log_root)
-            run_dirs_by_proto[proto] = []
-            continue
-
-        if run_ids:
-            available_by_name = {d.name: d for d in available}
-            selected = []
-            for rid in run_ids:
-                path = available_by_name.get(rid)
-                if path is not None:
-                    selected.append(path)
-                else:
-                    logging.warning("Requested run_id %s not found under %s", rid, proto)
-        elif latest_n is not None:
-            selected = available[-latest_n:]
-        else:
-            selected = available[-1:]
-        run_dirs_by_proto[proto] = selected
-    return run_dirs_by_proto
-
-
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
-def _find_retrans_column(columns: Sequence[str]) -> str | None:
-    for name in ("retrans.", "retrans", "retransmissions", "retransmission"):
-        if name in columns:
-            return name
-    return None
-
-
-def _find_spurious_column(columns: Sequence[str]) -> str | None:
-    for name in ("spurious", "spurious retransmissions"):
-        if name in columns:
-            return name
-    return None
-
-
-def _pair_id_from_filename(path: Path, prefix: str) -> str:
-    """
-    Extract a pair identifier from a filename with a known prefix.
-    Examples: elephant_00.csv -> "00", mouse_01_0003.csv -> "01_0003".
-    """
-    stem = path.stem
-    if stem.startswith(prefix):
-        suffix = stem[len(prefix) :]
-        if suffix.startswith("_"):
-            suffix = suffix[1:]
-        return suffix or stem
-    return stem
-
-
-def load_elephant_goodput(csv_path: Path) -> List[float]:
-    try:
-        df = pd.read_csv(csv_path)
-    except FileNotFoundError:
-        logging.warning("Elephant CSV not found: %s", csv_path)
-        return []
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logging.warning("Failed to read %s: %s", csv_path, exc)
-        return []
-
-    df = _normalize_columns(df)
-    if "Duration" not in df or "Sent" not in df:
-        logging.warning("Required columns missing in %s", csv_path)
-        return []
-
-    durations = pd.to_numeric(df["Duration"], errors="coerce")
-    sent = pd.to_numeric(df["Sent"], errors="coerce")
-    valid = durations.notna() & sent.notna() & (durations > 0)
-    if valid.sum() == 0:
-        logging.warning("No valid rows in %s", csv_path)
-        return []
-
-    # Goodput based on client transmit direction: Sent bytes over Duration.
-    goodput_mbps = (sent[valid] * 8 / durations[valid]) / 1e6
-    return goodput_mbps.tolist()
-
-
-def load_mouse_fcts(csv_path: Path) -> List[Dict[str, object]]:
-    try:
-        df = pd.read_csv(csv_path)
-    except FileNotFoundError:
-        logging.warning("Mouse CSV not found: %s", csv_path)
-        return []
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logging.warning("Failed to read %s: %s", csv_path, exc)
-        return []
-
-    df = _normalize_columns(df)
-    if "Duration" not in df:
-        logging.warning("Duration column missing in %s", csv_path)
-        return []
-
-    durations = pd.to_numeric(df["Duration"], errors="coerce")
-    valid = durations.notna() & (durations > 0)
-    if valid.sum() == 0:
-        return []
-    retrans_col = _find_retrans_column(df.columns)
-    spurious_col = _find_spurious_column(df.columns)
-    if retrans_col is None:
-        retrans_vals = pd.Series(0, index=df.index, dtype=float)
-    else:
-        retrans_vals = pd.to_numeric(df[retrans_col], errors="coerce").fillna(0)
-    if spurious_col is None:
-        spurious_vals = pd.Series(0, index=df.index, dtype=float)
-    else:
-        spurious_vals = pd.to_numeric(df[spurious_col], errors="coerce").fillna(0)
-
-    drop_retrans = (retrans_vals - spurious_vals).clip(lower=0)
-    rows: List[Dict[str, object]] = []
-    for duration, retrans, drop in zip(
-        durations[valid], retrans_vals[valid], drop_retrans[valid]
-    ):
-        rows.append(
-            {
-                "fct_s": float(duration),
-                "had_retrans": bool(float(retrans) > 0),
-                "had_drop_retrans": bool(float(drop) > 0),
-            }
-        )
-    return rows
-
-
-def _extract_tx_bytes(entry: Mapping[str, float]) -> float:
-    try:
-        return float(entry.get("tx", 0.0))
-    except Exception:
-        return 0.0
-
-
-def load_switch_tx_deltas(
-    before_path: Path, after_path: Path
-) -> Dict[str, float]:
-    try:
-        with before_path.open() as f:
-            before = json.load(f)
-        with after_path.open() as f:
-            after = json.load(f)
-    except FileNotFoundError:
-        logging.warning("Switch stats missing: %s or %s", before_path, after_path)
-        return {}
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logging.warning("Failed to read switch stats: %s", exc)
-        return {}
-
-    deltas: Dict[str, float] = {}
-    for if_name in set(before.keys()) | set(after.keys()):
-        delta = _extract_tx_bytes(after.get(if_name, {})) - _extract_tx_bytes(
-            before.get(if_name, {})
-        )
-        deltas[if_name] = float(delta)
-    # TODO: Narrow to uplinks only if interface naming allows reliable detection.
-    return deltas
-
-
-def collect_all_data(
-    log_root: Path,
-    protos: Sequence[str],
-    run_dirs_by_proto: Mapping[str, Sequence[Path]] | None = None,
-) -> Dict[str, pd.DataFrame]:
-    elephant_rows: List[Dict[str, object]] = []
-    mouse_rows: List[Dict[str, object]] = []
-    link_rows: List[Dict[str, object]] = []
-
-    for proto in protos:
-        run_dirs = (
-            run_dirs_by_proto.get(proto, [])
-            if run_dirs_by_proto is not None
-            else list_run_dirs(log_root, proto)
-        )
-        for run_dir in run_dirs:
-            run_id = run_dir.name
-            elephant_paths = sorted(run_dir.glob("elephant_*.csv"))
-            mouse_paths = sorted(run_dir.glob("mouse_*.csv"))
-            before_path = run_dir / "switch_stats_before.json"
-            after_path = run_dir / "switch_stats_after.json"
-
-            missing = []
-            if not elephant_paths:
-                missing.append("elephant_*.csv")
-            if not mouse_paths:
-                missing.append("mouse_*.csv")
-            if not before_path.exists():
-                missing.append("switch_stats_before.json")
-            if not after_path.exists():
-                missing.append("switch_stats_after.json")
-            if missing:
-                logging.warning(
-                    "Skipping %s/%s due to missing files: %s",
-                    proto,
-                    run_id,
-                    ", ".join(missing),
-                )
-                continue
-
-            for csv_path in elephant_paths:
-                pair_id = _pair_id_from_filename(csv_path, "elephant")
-                for val in load_elephant_goodput(csv_path):
-                    elephant_rows.append(
-                        {
-                            "proto": proto,
-                            "run_id": run_id,
-                            "pair_id": pair_id,
-                            "goodput_mbps": float(val),
-                        }
-                    )
-
-            for csv_path in mouse_paths:
-                pair_id = _pair_id_from_filename(csv_path, "mouse")
-                for row in load_mouse_fcts(csv_path):
-                    mouse_rows.append(
-                        {
-                            "proto": proto,
-                            "run_id": run_id,
-                            "pair_id": pair_id,
-                            **row,
-                        }
-                    )
-
-            deltas = load_switch_tx_deltas(before_path, after_path)
-            for if_name, delta in deltas.items():
-                link_rows.append(
-                    {
-                        "proto": proto,
-                        "run_id": run_id,
-                        "if_name": if_name,
-                        "delta_tx_bytes": float(delta),
-                    }
-                )
-
-    elephant_df = pd.DataFrame(
-        elephant_rows, columns=["proto", "run_id", "pair_id", "goodput_mbps"]
-    )
-    mouse_df = pd.DataFrame(
-        mouse_rows,
-        columns=["proto", "run_id", "pair_id", "fct_s", "had_retrans", "had_drop_retrans"],
-    )
-    link_df = pd.DataFrame(
-        link_rows, columns=["proto", "run_id", "if_name", "delta_tx_bytes"]
-    )
-    return {"elephant": elephant_df, "mouse": mouse_df, "link": link_df}
-
-
-def jain_index(values: Sequence[float]) -> float:
-    arr = np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return float("nan")
-    numerator = np.square(arr.sum())
-    denominator = arr.size * np.square(arr).sum()
-    if denominator == 0:
-        return float("nan")
-    return float(numerator / denominator)
-
-
-def compute_fairness(link_df: pd.DataFrame) -> pd.DataFrame:
-    fairness_rows: List[Dict[str, object]] = []
-    if link_df.empty:
-        return pd.DataFrame(columns=["proto", "run_id", "jain"])
-
-    for (proto, run_id), group in link_df.groupby(["proto", "run_id"]):
-        jain = jain_index(group["delta_tx_bytes"].to_numpy())
-        fairness_rows.append({"proto": proto, "run_id": run_id, "jain": jain})
-    return pd.DataFrame(fairness_rows)
 
 
 def _plot_cdf(ax, values: np.ndarray, label: str):
@@ -705,63 +397,16 @@ def plot_mouse_fct_histogram(
     plt.close(fig)
 
 
-def write_summary(
-    output_path: Path,
-    elephant_df: pd.DataFrame,
-    mouse_df: pd.DataFrame,
-    fairness_df: pd.DataFrame,
-    protos: Sequence[str],
-) -> None:
-    lines: List[str] = []
-    lines.append("Blackbox Analysis Summary")
-    lines.append("=" * 30)
-    lines.append("")
+def _subset_mouse(mouse_df: pd.DataFrame, proto: str) -> pd.DataFrame:
+    if "proto" not in mouse_df.columns:
+        return mouse_df.iloc[0:0]
+    return mouse_df[mouse_df["proto"] == proto]
 
-    lines.append("Elephant Goodput (Mbps)")
-    for proto in protos:
-        subset = elephant_df[elephant_df["proto"] == proto]
-        if subset.empty:
-            lines.append(f"- {proto}: no data")
-            continue
-        p50 = np.percentile(subset["goodput_mbps"], 50)
-        p90 = np.percentile(subset["goodput_mbps"], 90)
-        p99 = np.percentile(subset["goodput_mbps"], 99)
-        lines.append(
-            f"- {proto}: mean={subset['goodput_mbps'].mean():.3f}, "
-            f"std={subset['goodput_mbps'].std(ddof=0):.3f}, "
-            f"median={p50:.3f}, p90={p90:.3f}, p99={p99:.3f}, "
-            f"samples={len(subset)}"
-        )
-    lines.append("")
 
-    lines.append("Mouse FCT (s)")
-    for proto in protos:
-        subset = mouse_df[mouse_df["proto"] == proto]
-        if subset.empty:
-            lines.append(f"- {proto}: no data")
-            continue
-        p50 = np.percentile(subset["fct_s"], 50)
-        p90 = np.percentile(subset["fct_s"], 90)
-        p99 = np.percentile(subset["fct_s"], 99)
-        lines.append(
-            f"- {proto}: p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f}, "
-            f"samples={len(subset)}"
-        )
-    lines.append("")
-
-    lines.append("Jain's Fairness Index")
-    for proto in protos:
-        subset = fairness_df[fairness_df["proto"] == proto]
-        if subset.empty:
-            lines.append(f"- {proto}: no data")
-            continue
-        lines.append(
-            f"- {proto}: mean={subset['jain'].mean():.3f}, "
-            f"std={subset['jain'].std(ddof=0):.3f}, runs={len(subset)}"
-        )
-
-    output_path.write_text("\n".join(lines))
-    logging.info("Wrote summary to %s", output_path)
+def _count_true(subset: pd.DataFrame, column: str) -> int:
+    if column not in subset.columns:
+        return 0
+    return int(subset[column].fillna(False).astype(bool).sum())
 
 
 def main() -> None:
@@ -816,7 +461,7 @@ def main() -> None:
     link_df = data["link"]
 
     if elephant_df.empty and mouse_df.empty and link_df.empty:
-        logging.error("No data found under %s", args.log_root)
+        logging.error("No data found under %s", log_root)
         return
 
     fairness_df = compute_fairness(link_df)
@@ -891,16 +536,6 @@ def main() -> None:
     except ImportError:  # pragma: no cover - support script execution
         import mouse_droploss_plot as droploss
         import mouse_retrans_plot as retrans
-
-    def _subset_mouse(mouse_df: pd.DataFrame, proto: str) -> pd.DataFrame:
-        if "proto" not in mouse_df.columns:
-            return mouse_df.iloc[0:0]
-        return mouse_df[mouse_df["proto"] == proto]
-
-    def _count_true(subset: pd.DataFrame, column: str) -> int:
-        if column not in subset.columns:
-            return 0
-        return int(subset[column].fillna(False).astype(bool).sum())
 
     droploss_summaries: List[droploss.DropLossSummary] = []
     for proto in PROTO_ORDER:
