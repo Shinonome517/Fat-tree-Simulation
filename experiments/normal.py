@@ -7,12 +7,13 @@ captures switch statistics to compare QUIC/MPQUIC/TCP/MPTCP under ECMP.
 import argparse
 import json
 import random
+import re
 import shlex
 import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 # Ensure repo root is on sys.path when executed as a script.
 import sys
@@ -25,7 +26,7 @@ from experiments import (
     picoquic_perf_cmd,
     snapshot_switch_bytes,
 )
-from topology import stop_fattree_topology
+from topology import host_ips, stop_fattree_topology
 
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario
 DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
@@ -34,6 +35,7 @@ DEFAULT_KILL_GRACE_SECONDS = 3.0  # grace before SIGKILL when stopping processes
 SERVER_IDLE_TIMEOUT_MS = 5000
 CONGESTION_CONTROL = "cubic"
 PROTO_CHOICES = ("quic", "mpquic", "tcp", "mptcp")
+ROLE_MODE_CHOICES = ("mixed", "split")
 LOG_ROOT_NAME = "normal"
 TCP_PERF_PATH = Path(__file__).resolve().parent / "tcp_perf.py"
 PYTHON_BIN = "/usr/bin/python3"  # Use absolute python path inside Mininet hosts.
@@ -76,6 +78,7 @@ ROLE_ELEPHANT_CLIENT = "elephant-client"
 ROLE_MOUSE_SERVER = "mouse-server"
 ROLE_MOUSE_CLIENT = "mouse-client"
 ELEPHANT_MAX_WAIT_PAD_SECONDS = 60.0  # extra wait beyond duration before forcing elephant teardown
+HOSTNAME_RE = re.compile(r"h(\d+)(\d)(\d)$")
 
 
 def _format_extra_args(extra_args: Union[Iterable[str], str, None]) -> str:
@@ -265,7 +268,7 @@ def _apply_tcp_sysctls(hosts: Sequence, proto: str) -> None:
             host.cmd(f"sysctl -w {key}={val}")
 
 
-def get_extra_args(proto: str, role: str) -> List[str]:
+def get_extra_args(proto: str, role: str, alt_addrs: Optional[str] = None) -> List[str]:
     """
     Return picoquicdemo extra CLI arguments based on proto and role.
 
@@ -283,25 +286,107 @@ def get_extra_args(proto: str, role: str) -> List[str]:
         return base_args + ["-M"]
     if role == ROLE_ELEPHANT_CLIENT:
         args: List[str] = base_args + ["-M"]
-        if ELEPHANT_ALT_ADDRS_MPQUIC:
-            args += ["-A", ELEPHANT_ALT_ADDRS_MPQUIC]
+        alt = alt_addrs or ELEPHANT_ALT_ADDRS_MPQUIC
+        if alt:
+            args += ["-A", alt]
         return args
     if role in (ROLE_MOUSE_SERVER, ROLE_MOUSE_CLIENT):
         return base_args
     return base_args
 
 
-def _pick_random_pairs(hosts: Sequence, count: int) -> List[Tuple]:
+def _host_coords_from_name(name: str) -> Optional[Tuple[int, int, int]]:
+    match = HOSTNAME_RE.fullmatch(name or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _build_host_coord_map(ctx) -> Dict[object, Tuple[int, int, int]]:
+    coords: Dict[object, Tuple[int, int, int]] = {}
+    for p, pod_hosts in enumerate(ctx.hosts):
+        for e, edge_hosts in enumerate(pod_hosts):
+            for h, host in enumerate(edge_hosts):
+                coords[host] = (p, e, h)
+    return coords
+
+
+def _select_primary_intf(host) -> Optional[str]:
+    if not host:
+        return None
+    for intf in host.intfList():
+        name = getattr(intf, "name", None)
+        if name and name != "lo":
+            return name
+    return None
+
+
+def _extra_host_ips(coords: Optional[Tuple[int, int, int]]) -> List[str]:
+    if not coords:
+        return []
+    p, e, h = coords
+    ips = host_ips(p, e, h)
+    return [ip.split("/")[0] for ip in ips[1:]]  # skip primary, keep extras only
+
+
+def _mpquic_alt_addrs(host, iface: Optional[str], coords: Optional[Tuple[int, int, int]]) -> str:
+    alt_ips = _extra_host_ips(coords)
+    if not alt_ips or not iface:
+        return ""
+    ifindex_raw = host.cmd(f"cat /sys/class/net/{iface}/ifindex 2>/dev/null").strip()
+    try:
+        ifindex = int(ifindex_raw)
+    except Exception:
+        print(f"[normal] warning: failed to read ifindex for {host.name}:{iface} ({ifindex_raw}); skipping -A.")
+        return ""
+    return ",".join(f"{ip}/{ifindex}" for ip in alt_ips)
+
+
+def _ensure_mptcp_endpoints(host, iface: Optional[str], coords: Optional[Tuple[int, int, int]]) -> None:
+    alt_ips = _extra_host_ips(coords)
+    if not alt_ips or not iface:
+        return
+    host.cmd("ip mptcp limits set add_addr_accepted 4 subflow 4 signal 4 2>/dev/null || true")
+    for ip in alt_ips:
+        host.cmd(
+            f"ip mptcp endpoint show | grep -w '{ip}' >/dev/null 2>&1 || "
+            f"ip mptcp endpoint add {ip} dev {iface} signal"
+        )
+
+
+def _pick_random_pairs(
+    hosts: Sequence,
+    count: int,
+    src_pool: Optional[Sequence] = None,
+    dst_pool: Optional[Sequence] = None,
+) -> List[Tuple]:
     pairs: List[Tuple] = []
     if len(hosts) < 2:
         return pairs
+    sources = list(src_pool) if src_pool is not None else list(hosts)
+    destinations = list(dst_pool) if dst_pool is not None else list(hosts)
+    if not sources or not destinations:
+        return pairs
     for _ in range(count):
-        src = random.choice(hosts)
-        dst = random.choice(hosts)
-        while dst == src:
-            dst = random.choice(hosts)
+        src = random.choice(sources)
+        dst = random.choice(destinations)
+        while dst == src and len(destinations) > 1:
+            dst = random.choice(destinations)
         pairs.append((src, dst))
     return pairs
+
+
+def _split_sender_pools(hosts: Sequence) -> Tuple[List, List]:
+    """
+    Split hosts into two non-empty, disjoint pools for Elephant/Mouse senders.
+    Falls back to mixed use if hosts are insufficient.
+    """
+    hosts_copy = list(hosts)
+    if len(hosts_copy) < 2:
+        return hosts_copy, hosts_copy
+    random.shuffle(hosts_copy)
+    mid = max(1, min(len(hosts_copy) - 1, len(hosts_copy) // 2))
+    return hosts_copy[:mid], hosts_copy[mid:]
 
 
 def _mouse_generator(
@@ -364,8 +449,8 @@ def _mouse_generator(
         proc_store[:] = [p for p in proc_store if p and p.poll() is None]
 
 
-def _elephant_client_extra(proto: str) -> List[str]:
-    return get_extra_args(proto, ROLE_ELEPHANT_CLIENT)
+def _elephant_client_extra(proto: str, alt_addrs: Optional[str] = None) -> List[str]:
+    return get_extra_args(proto, ROLE_ELEPHANT_CLIENT, alt_addrs=alt_addrs)
 
 
 def _elephant_server_extra(proto: str) -> List[str]:
@@ -381,6 +466,7 @@ def _healthcheck(
     port: int,
     log_dir: Path,
     run_tag: str = "",
+    client_alt_addrs: Optional[str] = None,
 ) -> None:
     """
     Lightweight pre-flight: ensure server process exists, reachability works, and a short
@@ -421,6 +507,7 @@ def _healthcheck(
         client_extra = get_extra_args(
             proto,
             ROLE_ELEPHANT_CLIENT if label == "elephant" else ROLE_MOUSE_CLIENT,
+            alt_addrs=client_alt_addrs if label == "elephant" else None,
         )
         extra_str = _format_extra_args(client_extra)
         hc_cmd = (
@@ -474,6 +561,7 @@ def run_normal_once(
     elephant_load_fraction: float,
     enable_qlog: bool = False,
     output_subdir: Optional[Path] = None,
+    role_mode: str = "mixed",
 ) -> None:
     """Execute one normal experiment run."""
     seed = base_seed + run_index
@@ -506,8 +594,18 @@ def run_normal_once(
             json.dumps(before_stats, indent=2)
         )
 
-        elephant_pairs = _pick_random_pairs(hosts_flat, ELEPHANT_PAIR_COUNT)
-        mouse_pairs = _pick_random_pairs(hosts_flat, MOUSE_PAIR_COUNT)
+        if role_mode not in ROLE_MODE_CHOICES:
+            raise ValueError(f"role_mode must be one of {ROLE_MODE_CHOICES}")
+        if role_mode == "split":
+            ele_src_pool, mouse_src_pool = _split_sender_pools(hosts_flat)
+            if not ele_src_pool or not mouse_src_pool:
+                print(f"{run_tag} warning: unable to split sender pools; falling back to mixed.")
+                ele_src_pool = mouse_src_pool = hosts_flat
+        else:
+            ele_src_pool = mouse_src_pool = hosts_flat
+
+        elephant_pairs = _pick_random_pairs(hosts_flat, ELEPHANT_PAIR_COUNT, src_pool=ele_src_pool)
+        mouse_pairs = _pick_random_pairs(hosts_flat, MOUSE_PAIR_COUNT, src_pool=mouse_src_pool)
         print(
             f"{run_tag} selected pairs: elephants={len(elephant_pairs)}, mice={len(mouse_pairs)}"
         )
@@ -522,8 +620,25 @@ def run_normal_once(
             for idx, (src, dst) in enumerate(mouse_pairs):
                 f.write(f"{idx:02d}: {src.name} -> {dst.name} (dst_ip={dst.IP()})\n")
 
+        host_coord_map = _build_host_coord_map(ctx)
+        elephant_senders = {src for src, _ in elephant_pairs}
+        elephant_iface_map: Dict[object, Optional[str]] = {}
+        elephant_alt_map: Dict[object, str] = {}
+
+        # Prepare per-Elephant sender multipath setup.
+        for host in elephant_senders:
+            iface = _select_primary_intf(host)
+            elephant_iface_map[host] = iface
+            coords = host_coord_map.get(host) or _host_coords_from_name(host.name)
+            if proto == "mpquic":
+                alt = _mpquic_alt_addrs(host, iface, coords)
+                elephant_alt_map[host] = alt
+            if proto == "mptcp":
+                _ensure_mptcp_endpoints(host, iface, coords)
+
         elephant_server_hosts = {dst.name: dst for _, dst in elephant_pairs}.values()
         mouse_server_hosts = {dst.name: dst for _, dst in mouse_pairs}.values()
+        mouse_proto = "tcp" if proto == "mptcp" else proto
 
         print(f"{run_tag} starting servers for destinations (proto={proto}).")
         if proto in ("quic", "mpquic"):
@@ -564,7 +679,7 @@ def run_normal_once(
             for host in mouse_server_hosts:
                 log_path = log_dir / f"mouse_server_{host.name}.log"
                 proc = host.popen(
-                    _tcp_perf_server_cmd(MOUSE_PORT, proto),
+                    _tcp_perf_server_cmd(MOUSE_PORT, mouse_proto),
                     stdout=log_path.open("w"),
                     stderr=subprocess.STDOUT,
                     shell=False,
@@ -585,8 +700,9 @@ def run_normal_once(
                 raise RuntimeError(f"tcp servers not listening after retries; pgrep={debug}")
 
         start_time = time.time()
-        elephant_extra = _elephant_client_extra(proto) if proto in ("quic", "mpquic") else []
-        mouse_extra = get_extra_args(proto, ROLE_MOUSE_CLIENT) if proto in ("quic", "mpquic") else []
+        mouse_extra = (
+            get_extra_args(mouse_proto, ROLE_MOUSE_CLIENT) if mouse_proto in ("quic", "mpquic") else []
+        )
         elephant_target_bytes = elephant_bytes
         if elephant_target_bytes is None:
             link_bps = DEFAULT_LINK_BW_MBPS * 1_000_000
@@ -607,12 +723,13 @@ def run_normal_once(
                 port=ELEPHANT_PORT,
                 log_dir=log_dir,
                 run_tag=run_tag,
+                client_alt_addrs=elephant_alt_map.get(src) if proto == "mpquic" else None,
             )
         if mouse_pairs:
             src, dst = mouse_pairs[0]
             _healthcheck(
                 label="mouse",
-                proto=proto,
+                proto=mouse_proto,
                 server_host=dst,
                 client_host=src,
                 server_ip=dst.IP(),
@@ -629,12 +746,16 @@ def run_normal_once(
                 f"{run_tag} elephant {idx:02d}: payload_bytes={elephant_target_bytes}, dst={dst_ip}"
             )
             if proto in ("quic", "mpquic"):
+                extra = _elephant_client_extra(
+                    proto,
+                    elephant_alt_map.get(src) if proto == "mpquic" else None,
+                )
                 elephant_cmd = picoquic_perf_cmd(
                     server_ip=dst_ip,
                     server_port=ELEPHANT_PORT,
                     csv_path=csv_path,
                     scenario=elephant_scenario,
-                    extra_args=elephant_extra,
+                    extra_args=extra,
                     as_list=True,
                 )
             else:
@@ -665,7 +786,7 @@ def run_normal_once(
                     mouse_stop,
                     proc_list,
                     mouse_extra,
-                    proto,
+                    mouse_proto,
                     run_tag,
                 ),
                 daemon=True,
@@ -753,6 +874,12 @@ def main() -> None:
         action="store_true",
         help="Enable picoquicdemo -l qlog capture for servers (default: disabled for performance).",
     )
+    parser.add_argument(
+        "--role-mode",
+        choices=list(ROLE_MODE_CHOICES),
+        default="mixed",
+        help="Sender role selection: 'split' uses disjoint Elephant/Mouse source pools, 'mixed' allows overlap.",
+    )
     args = parser.parse_args()
 
     for run_idx in range(args.runs):
@@ -766,6 +893,7 @@ def main() -> None:
             elephant_load_fraction=args.elephant_load_frac,
             enable_qlog=args.enable_qlog,
             output_subdir=args.output_dir,
+            role_mode=args.role_mode,
         )
 
 
