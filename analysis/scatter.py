@@ -104,14 +104,16 @@ def plot_run_p99_scatter(
 
     lo = float(np.nanmin([x_vals.min(), y_vals.min()]))
     hi = float(np.nanmax([x_vals.max(), y_vals.max()]))
-    ax.plot([lo, hi], [lo, hi], linestyle="--", color="gray", label="y = x")
+    ax.plot([lo, hi], [lo, hi], linestyle="--", color="gray")  # reference line
 
     ax.set_xlabel(f"{proto_x} P99 FCT (ms)")
     ax.set_ylabel(f"{proto_y} P99 FCT (ms)")
     ax.set_title("Per-run P99 Mouse FCT (seed-aligned)")
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.set_aspect("equal", "box")
-    ax.legend()
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(handles, labels)
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)

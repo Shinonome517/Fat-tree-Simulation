@@ -217,3 +217,5 @@ analysis/plots/
 analysis_test/
 *.bin
 run_all.sh
+analyze_all.sh
+script_logs/

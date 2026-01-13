@@ -22,7 +22,7 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from fattree_heatmap import plot_fattree_heatmap
+from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
 
 
 DEFAULT_LOG_ROOT = Path("./logs/blackbox")
@@ -778,6 +778,10 @@ def main() -> None:
 
     fairness_df = compute_fairness(link_df)
 
+    plot_fattree_topology(
+        output_dir / f"fattree_topology_k{args.k}.png",
+        k=args.k,
+    )
     plot_elephant_goodput_bar(
         elephant_df,
         output_dir / "blackbox_elephant_goodput_bar.png",

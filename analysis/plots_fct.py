@@ -64,7 +64,7 @@ def plot_fct_cdf(
             had_retrans_all = subset["had_retrans"].to_numpy().astype(bool)
         else:
             had_retrans_all = np.zeros(values_all.shape, dtype=bool)
-        outlier_mask, lower, upper = _outlier_mask(values_all)
+        outlier_mask, _, _ = _outlier_mask(values_all)
         values = values_all[~outlier_mask] if exclude_outliers else values_all
         if values.size == 0:
             logging.warning("All mouse FCT values are outliers for %s", proto)
@@ -155,58 +155,67 @@ def plot_fct_ccdf(
             had_retrans_all = subset["had_retrans"].to_numpy().astype(bool)
         else:
             had_retrans_all = np.zeros(values_all.shape, dtype=bool)
-        outlier_mask, lower, upper = _outlier_mask(values_all)
-        values = values_all[~outlier_mask] if exclude_outliers else values_all
+        if exclude_outliers:
+            p99_threshold = np.percentile(values_all, 99)
+            values = values_all[values_all <= p99_threshold]
+        else:
+            values = values_all
         if values.size == 0:
-            logging.warning("All mouse FCT values are outliers for %s", proto)
+            logging.warning("No mouse FCT values <= p99 for %s", proto)
             continue
-        values_sorted = np.sort(values * scale)
+        values_scaled = values * scale
+        values_sorted = np.sort(values_scaled)
         y = np.arange(len(values_sorted), 0, -1) / len(values_sorted)
-        (line,) = ax.step(values_sorted, y, where="post", label=proto)
+        label = proto if not exclude_outliers else f"{proto} (<=p99)"
+        (line,) = ax.step(values_sorted, y, where="post", label=label)
         color = line.get_color()
-        p50, p90, p99 = np.percentile(values * scale, [50, 90, 99])
-        ax.scatter(
-            [p50, p90, p99],
-            [0.5, 0.1, 0.01],
-            color=color,
-            marker="x",
-            s=25,
-            label=f"{proto} p50/p90/p99",
-        )
-        line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
-        if mark_outliers and not exclude_outliers and outlier_mask.any():
-            sort_idx = np.argsort(values_all)
-            values_sorted_all = values_all[sort_idx]
+        if not exclude_outliers:
+            p50, p90, p99 = np.percentile(values_scaled, [50, 90, 99])
+            ax.scatter(
+                [p50, p90, p99],
+                [0.5, 0.1, 0.01],
+                color=color,
+                marker="x",
+                s=25,
+                label=f"{proto} p50/p90/p99",
+            )
+            line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
+        if mark_outliers and not exclude_outliers and values_all.size:
+            values_all_scaled = values_all * scale
+            sort_idx = np.argsort(values_all_scaled)
+            values_sorted_all = values_all_scaled[sort_idx]
             retrans_sorted = had_retrans_all[sort_idx]
             y_all = np.arange(len(values_sorted_all), 0, -1) / len(values_sorted_all)
-            sorted_mask = (values_sorted_all < lower) | (values_sorted_all > upper)
-            outlier_y = y_all[sorted_mask]
-            outlier_values = values_sorted_all[sorted_mask] * scale
-            outlier_retrans = retrans_sorted[sorted_mask]
-            no_retrans_mask = ~outlier_retrans
-            has_retrans_mask = outlier_retrans
-            if np.any(no_retrans_mask):
-                ax.scatter(
-                    outlier_values[no_retrans_mask],
-                    outlier_y[no_retrans_mask],
-                    facecolors="none",
-                    edgecolors=color,
-                    marker="o",
-                    s=24,
-                    linewidth=1.0,
-                    label=f"{proto} outliers (no retrans)",
-                )
-            if np.any(has_retrans_mask):
-                ax.scatter(
-                    outlier_values[has_retrans_mask],
-                    outlier_y[has_retrans_mask],
-                    facecolors=color,
-                    edgecolors=color,
-                    marker="s",
-                    s=24,
-                    linewidth=0.8,
-                    label=f"{proto} outliers (retrans)",
-                )
+            p999 = np.percentile(values_all_scaled, 99.9)
+            tail_mask = values_sorted_all >= p999
+            if np.any(tail_mask):
+                tail_values = values_sorted_all[tail_mask]
+                tail_y = y_all[tail_mask]
+                tail_retrans = retrans_sorted[tail_mask]
+                no_retrans_mask = ~tail_retrans
+                has_retrans_mask = tail_retrans
+                if np.any(no_retrans_mask):
+                    ax.scatter(
+                        tail_values[no_retrans_mask],
+                        tail_y[no_retrans_mask],
+                        facecolors="none",
+                        edgecolors=color,
+                        marker="o",
+                        s=24,
+                        linewidth=1.0,
+                        label=f"{proto} tail>=p99.9 (no retrans)",
+                    )
+                if np.any(has_retrans_mask):
+                    ax.scatter(
+                        tail_values[has_retrans_mask],
+                        tail_y[has_retrans_mask],
+                        facecolors=color,
+                        edgecolors=color,
+                        marker="s",
+                        s=24,
+                        linewidth=0.8,
+                        label=f"{proto} tail>=p99.9 (retrans)",
+                    )
         has_data = True
 
     if not has_data:
@@ -216,7 +225,7 @@ def plot_fct_ccdf(
         ax.set_ylabel("CCDF")
         title = "Mouse FCT CCDF"
         if exclude_outliers:
-            title += " (outliers removed, 1.5x IQR)"
+            title += " (outliers removed, <=p99)"
         ax.set_title(title)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.legend()

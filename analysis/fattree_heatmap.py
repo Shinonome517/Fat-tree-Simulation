@@ -50,6 +50,35 @@ def map_interface_to_edge(if_name: str) -> Tuple[str, str] | None:
     return None
 
 
+def _draw_topology(
+    G: nx.Graph,
+    pos: Mapping[str, Tuple[float, float]],
+    ax: plt.Axes,
+    *,
+    node_size: float = 120,
+    node_color: str = "#dddddd",
+    node_edgecolor: str = "#666666",
+    edge_color: str = "#888888",
+    edge_width: float = 1.5,
+    draw_edges: bool = True,
+    with_labels: bool = True,
+) -> None:
+    """Draw a fat-tree topology without load overlays for reuse across plots."""
+    nx.draw_networkx_nodes(
+        G,
+        pos=pos,
+        ax=ax,
+        node_size=node_size,
+        node_color=node_color,
+        edgecolors=node_edgecolor,
+        linewidths=0.5,
+    )
+    if draw_edges:
+        nx.draw_networkx_edges(G, pos=pos, ax=ax, edge_color=edge_color, width=edge_width)
+    if with_labels:
+        nx.draw_networkx_labels(G, pos=pos, ax=ax, font_size=7)
+
+
 def aggregate_link_loads(
     link_df: pd.DataFrame,
     protos: Sequence[str],
@@ -133,16 +162,7 @@ def plot_fattree_heatmap(
 
     for ax, proto in zip(axes, protos):
         loads = agg.get(proto, {}) or {}
-        # Draw nodes lightly for context.
-        nx.draw_networkx_nodes(
-            G,
-            pos=pos,
-            ax=ax,
-            node_size=120,
-            node_color="#dddddd",
-            edgecolors="#666666",
-            linewidths=0.5,
-        )
+        _draw_topology(G, pos, ax=ax, draw_edges=False, with_labels=False)
 
         edges = list(G.edges())
         edge_loads = [float(loads.get(_edge_key(*edge), 0.0)) for edge in edges]
@@ -156,7 +176,8 @@ def plot_fattree_heatmap(
         cmap = cm.viridis
         norm = mcolors.Normalize(vmin=0, vmax=max_load)
         colors = [cmap(norm(val)) for val in edge_loads]
-        widths = [1.0 + 3.0 * (val / max_load) for val in edge_loads]
+        # Scale edge widths linearly with intercept 2 so low-load links remain visible.
+        widths = [2.0 + 2.0 * (val / max_load) for val in edge_loads]
 
         nx.draw_networkx_edges(
             G,
@@ -173,6 +194,35 @@ def plot_fattree_heatmap(
         cbar.set_label("delta tx bytes")
         ax.set_title(f"{proto} link heatmap")
         ax.axis("off")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_fattree_topology(
+    output_path: Path,
+    *,
+    k: int = 4,
+    with_labels: bool = True,
+) -> None:
+    """Plot a plain fat-tree topology without load overlays (for slides/papers)."""
+    G = build_nx_graph_from_params(k=k)
+    pos = fattree_layout(G, k=k)
+
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    _draw_topology(
+        G,
+        pos,
+        ax=ax,
+        node_size=120,
+        node_color="#dddddd",
+        node_edgecolor="#666666",
+        edge_color="#888888",
+        edge_width=1.5,
+        with_labels=with_labels,
+    )
+    ax.axis("off")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)

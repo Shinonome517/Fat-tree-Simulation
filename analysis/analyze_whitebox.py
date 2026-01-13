@@ -15,7 +15,7 @@ from typing import List, Tuple
 
 import pandas as pd
 
-from fattree_heatmap import plot_fattree_heatmap
+from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
 from whitebox_loader import collect_all_data, select_run_dirs
 from whitebox_metrics import compute_fairness, write_summary
 from scatter import plot_run_p99_scatter
@@ -171,6 +171,10 @@ def main() -> None:
 
     fairness_df = compute_fairness(link_df)
 
+    plot_fattree_topology(
+        output_dir / f"fattree_topology_k{args.k}.png",
+        k=args.k,
+    )
     plot_goodput_bar(
         elephant_df,
         output_dir / "whitebox_goodput_bar.png",

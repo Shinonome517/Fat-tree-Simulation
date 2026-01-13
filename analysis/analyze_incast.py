@@ -15,7 +15,7 @@ from typing import List, Tuple
 
 import pandas as pd
 
-from fattree_heatmap import plot_fattree_heatmap
+from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
 from incast_loader import collect_all_data, select_run_dirs
 from incast_metrics import compute_fairness, write_summary
 from plots_fct import plot_fct_cdf, plot_fct_histogram
@@ -170,6 +170,10 @@ def main() -> None:
 
     fairness_df = compute_fairness(link_df)
 
+    plot_fattree_topology(
+        output_dir / f"fattree_topology_k{args.k}.png",
+        k=args.k,
+    )
     plot_goodput_bar(
         elephant_df,
         output_dir / "incast_goodput_bar.png",
