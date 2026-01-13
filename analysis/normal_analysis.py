@@ -34,6 +34,7 @@ OUTPUT_ROOT = Path("./analysis/plots/normal")
 PROTO_ORDER = ("mpquic", "quic", "mptcp", "tcp")
 MOUSE_DROPLOSS_FILENAME = "normal_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "normal_mouse_retrans_ratio.png"
+LINK_UTIL_SUBDIR = Path("link_utilization")
 
 
 def _positive_int(value: str) -> int:
@@ -451,6 +452,147 @@ def _count_true(subset: pd.DataFrame, column: str) -> int:
     return int(subset[column].fillna(False).astype(bool).sum())
 
 
+def _compute_link_util_series(link_ts_df: pd.DataFrame) -> pd.DataFrame:
+    if link_ts_df.empty:
+        return pd.DataFrame(
+            columns=["proto", "run_id", "sample_idx", "elapsed_s", "u_mean", "u_max", "cv"]
+        )
+    required = ["proto", "run_id", "sample_idx", "elapsed_s", "u_l"]
+    missing = [col for col in required if col not in link_ts_df.columns]
+    if missing:
+        logging.warning("Link timeseries missing columns: %s", ", ".join(missing))
+        return pd.DataFrame(
+            columns=["proto", "run_id", "sample_idx", "elapsed_s", "u_mean", "u_max", "cv"]
+        )
+
+    df = link_ts_df.copy()
+    df["u_l"] = pd.to_numeric(df["u_l"], errors="coerce")
+    df["elapsed_s"] = pd.to_numeric(df["elapsed_s"], errors="coerce")
+
+    rows: List[Dict[str, object]] = []
+    for (proto, run_id, sample_idx), group in df.groupby(["proto", "run_id", "sample_idx"]):
+        values = group["u_l"].dropna().to_numpy()
+        if values.size == 0:
+            continue
+        elapsed_vals = group["elapsed_s"].dropna().to_numpy()
+        elapsed = float(elapsed_vals.max()) if elapsed_vals.size else float("nan")
+        u_mean = float(values.mean())
+        u_max = float(values.max())
+        cv = float(values.std(ddof=0) / u_mean) if u_mean > 0 else 0.0
+        rows.append(
+            {
+                "proto": proto,
+                "run_id": run_id,
+                "sample_idx": sample_idx,
+                "elapsed_s": elapsed,
+                "u_mean": u_mean,
+                "u_max": u_max,
+                "cv": cv,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _u_max_percentiles(util_df: pd.DataFrame) -> Dict[Tuple[str, str], Tuple[float, float]]:
+    percentiles: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    if util_df.empty:
+        return percentiles
+    for (proto, run_id), group in util_df.groupby(["proto", "run_id"]):
+        values = group["u_max"].dropna().to_numpy()
+        if values.size == 0:
+            continue
+        p95, p99 = np.percentile(values, [95, 99])
+        percentiles[(proto, run_id)] = (float(p95), float(p99))
+    return percentiles
+
+
+def _plot_link_series(
+    x: np.ndarray,
+    y: np.ndarray,
+    title: str,
+    ylabel: str,
+    output_path: Path,
+    *,
+    p95: float | None = None,
+    p99: float | None = None,
+) -> None:
+    fig, ax = plt.subplots(figsize=(6, 3))
+    (line,) = ax.plot(x, y, label=title, linewidth=1.4)
+    color = line.get_color()
+    markers: List[Tuple[float, float, str]] = []
+    if p95 is not None:
+        ax.axhline(p95, color=color, linestyle="--", linewidth=1.0, alpha=0.65, label=f"P95={p95:.3f}")
+        markers.append((x[-1] if len(x) else 0.0, p95, "P95"))
+    if p99 is not None:
+        ax.axhline(p99, color=color, linestyle="--", linewidth=1.0, alpha=0.65, label=f"P99={p99:.3f}")
+        markers.append((x[-1] if len(x) else 0.0, p99, "P99"))
+    if markers:
+        for xpos, ypos, label in markers:
+            ax.scatter(
+                xpos,
+                ypos,
+                color=color,
+                marker="x",
+                s=60,
+                linewidth=1.2,
+                label=label,
+            )
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_link_util_timeseries(
+    util_df: pd.DataFrame,
+    percentiles: Dict[Tuple[str, str], Tuple[float, float]],
+    output_root: Path,
+) -> None:
+    if util_df.empty:
+        logging.warning("No link utilization timeseries data to plot.")
+        return
+
+    plot_root = output_root / LINK_UTIL_SUBDIR
+    for (proto, run_id), group in util_df.groupby(["proto", "run_id"]):
+        subdir = plot_root / proto / run_id
+        subdir.mkdir(parents=True, exist_ok=True)
+        sorted_group = group.sort_values("elapsed_s")
+        x = sorted_group["elapsed_s"].to_numpy()
+
+        _plot_link_series(
+            x,
+            sorted_group["u_mean"].to_numpy(),
+            title=f"{proto} {run_id} u_mean",
+            ylabel="Mean utilization (fraction)",
+            output_path=subdir / "u_mean.png",
+        )
+
+        p95 = p99 = None
+        if (proto, run_id) in percentiles:
+            p95, p99 = percentiles[(proto, run_id)]
+        _plot_link_series(
+            x,
+            sorted_group["u_max"].to_numpy(),
+            title=f"{proto} {run_id} u_max",
+            ylabel="Max utilization (fraction)",
+            output_path=subdir / "u_max.png",
+            p95=p95,
+            p99=p99,
+        )
+
+        _plot_link_series(
+            x,
+            sorted_group["cv"].to_numpy(),
+            title=f"{proto} {run_id} CV_u",
+            ylabel="Coeff. of variation",
+            output_path=subdir / "cv.png",
+        )
+
+
 def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
@@ -501,12 +643,15 @@ def main() -> None:
     elephant_df = data["elephant"]
     mouse_df = data["mouse"]
     link_df = data["link"]
+    link_ts_df = data.get("link_ts", pd.DataFrame())
 
     if elephant_df.empty and mouse_df.empty and link_df.empty:
         logging.error("No data found under %s", log_root)
         return
 
     fairness_df = compute_fairness(link_df)
+    util_df = _compute_link_util_series(link_ts_df)
+    u_max_percentiles = _u_max_percentiles(util_df)
 
     plot_fattree_topology(
         output_dir / f"fattree_topology_k{args.k}.png",
@@ -564,6 +709,11 @@ def main() -> None:
             PROTO_ORDER,
             k=args.k,
         )
+    plot_link_util_timeseries(
+        util_df,
+        u_max_percentiles,
+        output_dir=output_dir,
+    )
 
     write_summary(
         output_dir / "normal_summary.txt",

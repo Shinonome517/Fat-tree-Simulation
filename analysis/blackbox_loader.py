@@ -200,6 +200,28 @@ def load_switch_tx_deltas(
     return deltas
 
 
+def load_link_timeseries(path: Path) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(path)
+    except FileNotFoundError:
+        logging.warning("Link timeseries missing: %s", path)
+        return pd.DataFrame(
+            columns=["sample_idx", "elapsed_s", "if_name", "delta_tx_bytes", "u_l", "dt_s"]
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logging.warning("Failed to read link timeseries %s: %s", path, exc)
+        return pd.DataFrame(
+            columns=["sample_idx", "elapsed_s", "if_name", "delta_tx_bytes", "u_l", "dt_s"]
+        )
+    # Keep only expected columns if extras were added.
+    expected = ["sample_idx", "elapsed_s", "if_name", "delta_tx_bytes", "u_l", "dt_s"]
+    missing = [col for col in expected if col not in df.columns]
+    if missing:
+        logging.warning("Link timeseries %s missing columns: %s", path, ", ".join(missing))
+        return pd.DataFrame(columns=expected)
+    return df[expected]
+
+
 def collect_all_data(
     log_root: Path,
     protos: Sequence[str],
@@ -208,6 +230,7 @@ def collect_all_data(
     elephant_rows: List[Dict[str, object]] = []
     mouse_rows: List[Dict[str, object]] = []
     link_rows: List[Dict[str, object]] = []
+    link_ts_frames: List[pd.DataFrame] = []
 
     for proto in protos:
         run_dirs = (
@@ -221,16 +244,18 @@ def collect_all_data(
             mouse_paths = sorted(run_dir.glob("mouse_*.csv"))
             before_path = run_dir / "switch_stats_before.json"
             after_path = run_dir / "switch_stats_after.json"
+            link_ts_path = run_dir / "link_timeseries.csv"
 
             missing = []
             if not elephant_paths:
                 missing.append("elephant_*.csv")
             if not mouse_paths:
                 missing.append("mouse_*.csv")
-            if not before_path.exists():
-                missing.append("switch_stats_before.json")
-            if not after_path.exists():
-                missing.append("switch_stats_after.json")
+            if not link_ts_path.exists():
+                if not before_path.exists():
+                    missing.append("switch_stats_before.json")
+                if not after_path.exists():
+                    missing.append("switch_stats_after.json")
             if missing:
                 logging.warning(
                     "Skipping %s/%s due to missing files: %s",
@@ -238,7 +263,11 @@ def collect_all_data(
                     run_id,
                     ", ".join(missing),
                 )
-                continue
+                if link_ts_path.exists():
+                    # Allow missing before/after when timeseries is present.
+                    missing = [m for m in missing if not m.startswith("switch_stats")]
+                if missing:
+                    continue
 
             for csv_path in elephant_paths:
                 pair_id = _pair_id_from_filename(csv_path, "elephant")
@@ -264,16 +293,34 @@ def collect_all_data(
                         }
                     )
 
-            deltas = load_switch_tx_deltas(before_path, after_path)
-            for if_name, delta in deltas.items():
-                link_rows.append(
-                    {
-                        "proto": proto,
-                        "run_id": run_id,
-                        "if_name": if_name,
-                        "delta_tx_bytes": float(delta),
-                    }
-                )
+            if link_ts_path.exists():
+                ts_df = load_link_timeseries(link_ts_path)
+                if not ts_df.empty:
+                    ts_df = ts_df.copy()
+                    ts_df["proto"] = proto
+                    ts_df["run_id"] = run_id
+                    link_ts_frames.append(ts_df)
+                    totals = ts_df.groupby("if_name")["delta_tx_bytes"].sum().reset_index()
+                    for _, row in totals.iterrows():
+                        link_rows.append(
+                            {
+                                "proto": proto,
+                                "run_id": run_id,
+                                "if_name": row["if_name"],
+                                "delta_tx_bytes": float(row["delta_tx_bytes"]),
+                            }
+                        )
+            else:
+                deltas = load_switch_tx_deltas(before_path, after_path)
+                for if_name, delta in deltas.items():
+                    link_rows.append(
+                        {
+                            "proto": proto,
+                            "run_id": run_id,
+                            "if_name": if_name,
+                            "delta_tx_bytes": float(delta),
+                        }
+                    )
 
     elephant_df = pd.DataFrame(
         elephant_rows, columns=["proto", "run_id", "pair_id", "goodput_mbps"]
@@ -285,4 +332,20 @@ def collect_all_data(
     link_df = pd.DataFrame(
         link_rows, columns=["proto", "run_id", "if_name", "delta_tx_bytes"]
     )
-    return {"elephant": elephant_df, "mouse": mouse_df, "link": link_df}
+    link_ts_df = (
+        pd.concat(link_ts_frames, ignore_index=True)
+        if link_ts_frames
+        else pd.DataFrame(
+            columns=[
+                "sample_idx",
+                "elapsed_s",
+                "if_name",
+                "delta_tx_bytes",
+                "u_l",
+                "dt_s",
+                "proto",
+                "run_id",
+            ]
+        )
+    )
+    return {"elephant": elephant_df, "mouse": mouse_df, "link": link_df, "link_ts": link_ts_df}

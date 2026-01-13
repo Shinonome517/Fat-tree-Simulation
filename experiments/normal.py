@@ -5,6 +5,7 @@ captures switch statistics to compare QUIC/MPQUIC/TCP/MPTCP under ECMP.
 """
 
 import argparse
+import csv
 import json
 import random
 import re
@@ -39,6 +40,7 @@ ROLE_MODE_CHOICES = ("mixed", "split")
 LOG_ROOT_NAME = "normal"
 TCP_PERF_PATH = Path(__file__).resolve().parent / "tcp_perf.py"
 PYTHON_BIN = "/usr/bin/python3"  # Use absolute python path inside Mininet hosts.
+LINK_SAMPLE_INTERVAL_S = 0.1
 
 # TCP short-flow survivability (λ=80 flows/s) – intentionally aggressive for the closed DCNW lab.
 TCP_SYSCTL_SETTINGS = {
@@ -202,6 +204,107 @@ def _verify_tcp_servers(hosts: Iterable, port: int, label: str) -> None:
         raise RuntimeError(
             f"{label} server(s) not listening: " + ", ".join(missing)
         )
+
+
+class LinkSampler:
+    """Sample agg->core tx_bytes and compute utilization per LINK_SAMPLE_INTERVAL_S."""
+
+    def __init__(self, ctx, log_dir: Path, bw_mbps: int, run_tag: str, interval_s: float = LINK_SAMPLE_INTERVAL_S):
+        self.ctx = ctx
+        self.log_dir = log_dir
+        self.interval_s = interval_s
+        self.bw_mbps = bw_mbps
+        self.run_tag = run_tag
+        self.log_path = log_dir / "link_timeseries.csv"
+        self.meta_path = log_dir / "link_timeseries_meta.json"
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._interface_map = self._collect_interfaces()
+
+    def _collect_interfaces(self) -> Dict[object, List[str]]:
+        """Return {agg_node: [agg-to-core interfaces]}."""
+        iface_map: Dict[object, List[str]] = {}
+        pattern = re.compile(r"a\d+\d+-to-c\d+")
+        for pod_idx, pod_aggs in enumerate(self.ctx.aggs):
+            for agg_idx, agg_node in enumerate(pod_aggs):
+                names: List[str] = []
+                for intf in agg_node.intfList():
+                    name: Optional[str] = getattr(intf, "name", None)
+                    if not name:
+                        continue
+                    if name.startswith(f"a{pod_idx}{agg_idx}-to-c") and pattern.match(name):
+                        names.append(name)
+                if names:
+                    iface_map[agg_node] = sorted(names)
+        if iface_map:
+            meta = {
+                "bw_mbps": self.bw_mbps,
+                "sample_interval_s": self.interval_s,
+                "interfaces": sorted([name for names in iface_map.values() for name in names]),
+            }
+            self.meta_path.write_text(json.dumps(meta, indent=2))
+        return iface_map
+
+    def start(self) -> None:
+        if not self._interface_map:
+            print(f"{self.run_tag} link sampler: no agg->core interfaces found; skipping.")
+            return
+        print(f"{self.run_tag} starting link sampler for {sum(len(v) for v in self._interface_map.values())} interfaces.")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def _read_tx(self) -> Dict[str, float]:
+        readings: Dict[str, float] = {}
+        for node, names in self._interface_map.items():
+            if not names:
+                continue
+            paths = " ".join(f"/sys/class/net/{n}/statistics/tx_bytes" for n in names)
+            raw = node.cmd(f"cat {paths} 2>/dev/null").strip().split()
+            if len(raw) != len(names):
+                continue
+            for name, val in zip(names, raw):
+                try:
+                    readings[name] = float(val)
+                except Exception:
+                    continue
+        return readings
+
+    def _run(self) -> None:
+        prev = self._read_tx()
+        if not prev:
+            print(f"{self.run_tag} link sampler: initial read failed; stopping.")
+            return
+
+        start_time = time.perf_counter()
+        last_time = start_time
+        sample_idx = 0
+
+        with self.log_path.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["sample_idx", "elapsed_s", "if_name", "delta_tx_bytes", "u_l", "dt_s"])
+            while not self._stop.wait(self.interval_s):
+                now = time.perf_counter()
+                dt = now - last_time
+                if dt <= 0:
+                    continue
+                curr = self._read_tx()
+                if not curr:
+                    continue
+                elapsed = now - start_time
+                for if_name in sorted(prev.keys()):
+                    curr_val = curr.get(if_name)
+                    if curr_val is None:
+                        continue
+                    delta = max(0.0, curr_val - prev.get(if_name, 0.0))
+                    util = (delta * 8.0) / (self.bw_mbps * 1_000_000 * dt)
+                    writer.writerow([sample_idx, elapsed, if_name, delta, util, dt])
+                prev = curr
+                last_time = now
+                sample_idx += 1
 
 
 def _terminate_processes(procs: List[object], term_timeout: float = DEFAULT_KILL_GRACE_SECONDS) -> None:
@@ -581,6 +684,7 @@ def run_normal_once(
     mouse_proc_lists: List[List[object]] = []
     mouse_stop = threading.Event()
     all_mouse_procs: List[object] = []
+    link_sampler: Optional[LinkSampler] = None
 
     try:
         ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=75)
@@ -593,6 +697,14 @@ def run_normal_once(
         (log_dir / "switch_stats_before.json").write_text(
             json.dumps(before_stats, indent=2)
         )
+        link_sampler = LinkSampler(
+            ctx,
+            log_dir=log_dir,
+            bw_mbps=DEFAULT_LINK_BW_MBPS,
+            run_tag=run_tag,
+            interval_s=LINK_SAMPLE_INTERVAL_S,
+        )
+        link_sampler.start()
 
         if role_mode not in ROLE_MODE_CHOICES:
             raise ValueError(f"role_mode must be one of {ROLE_MODE_CHOICES}")
@@ -827,6 +939,8 @@ def run_normal_once(
             json.dumps(after_stats, indent=2)
         )
         print(f"{run_tag} switch stats captured (after).")
+        if link_sampler:
+            link_sampler.stop()
     finally:
         mouse_stop.set()
         for thread in mouse_threads:
@@ -837,6 +951,8 @@ def run_normal_once(
             elephant_procs + server_procs + all_mouse_procs,
             term_timeout=DEFAULT_KILL_GRACE_SECONDS,
         )
+        if link_sampler:
+            link_sampler.stop()
         stop_fattree_topology(ctx)
         print(f"{run_tag} teardown complete.")
 
