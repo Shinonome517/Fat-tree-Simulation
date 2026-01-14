@@ -3,7 +3,7 @@
 from pathlib import Path
 import shlex
 import time
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 from topology import FatTreeContext, build_fattree_topology
 
@@ -70,14 +70,25 @@ def make_log_dir(
     proto: str,
     log_root: Optional[Path] = None,
     suffix: Optional[str] = None,
+    extra_parts: Optional[Sequence[str]] = None,
 ) -> Path:
-    """Create and return a timestamped log directory for the given experiment."""
+    """
+    Create and return a timestamped log directory for the given experiment.
+
+    extra_parts, when provided, are inserted after the proto directory and
+    before the run name to add additional hierarchy.
+    """
     ts = time.strftime("%Y%m%d-%H%M%S")
     base = Path(log_root) if log_root is not None else Path("logs") / exp_kind
     run_name = f"run_{ts}"
     if suffix:
         run_name = f"{run_name}_{suffix}"
-    path = base / proto / run_name
+    path = base / proto
+    if extra_parts:
+        parts = [str(p) for p in extra_parts if str(p)]
+        if parts:
+            path = path.joinpath(*parts)
+    path = path / run_name
     path.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -3,7 +3,9 @@ Analyze normal experiment outputs (QUIC/MPQUIC/TCP/MPTCP).
 
 This script scans the normal log directory, aggregates elephant goodput,
 mouse flow completion time (FCT), and switch tx byte deltas, then produces
-comparison plots and a text summary.
+comparison plots and a text summary. It expects logs under
+logs/normal/<log-dir>/<proto>/<elephant-num>/<congestion-rate>/run_* and
+writes per-(elephant, congestion) results to analysis/plots/normal.
 """
 
 from __future__ import annotations
@@ -24,8 +26,13 @@ import matplotlib.pyplot as plt  # noqa: E402
 from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
 from plots_link import plot_link_heatmap
 from scatter import plot_run_p99_scatter
-from blackbox_loader import collect_all_data, select_run_dirs
-from blackbox_metrics import compute_fairness, write_summary
+from normal_loader import collect_all_data, select_run_dirs
+from normal_metrics import (
+    compute_fairness,
+    compute_link_util_series,
+    compute_u_max_percentiles,
+    write_summary,
+)
 
 
 LOG_ROOT_BASE = Path("./logs/normal")
@@ -35,6 +42,8 @@ PROTO_ORDER = ("mpquic", "quic", "mptcp", "tcp")
 MOUSE_DROPLOSS_FILENAME = "normal_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "normal_mouse_retrans_ratio.png"
 LINK_UTIL_SUBDIR = Path("link_utilization")
+DEFAULT_ELEPHANT_NUM = 4
+DEFAULT_CONGESTION_RATE = "0.2"
 
 
 def _positive_int(value: str) -> int:
@@ -45,6 +54,17 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("Value must be a positive integer.")
     return parsed
+
+
+def _collect_combos(*dfs: pd.DataFrame) -> set[tuple[int, str]]:
+    combos: set[tuple[int, str]] = set()
+    for df in dfs:
+        if df is None or df.empty:
+            continue
+        if "elephant_num" not in df.columns or "congestion_rate" not in df.columns:
+            continue
+        combos.update(zip(df["elephant_num"], df["congestion_rate"]))
+    return combos
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +82,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("default"),
         help="Output subdirectory name under analysis/plots/normal (default: default).",
+    )
+    parser.add_argument(
+        "--elephant-num",
+        action="append",
+        type=_positive_int,
+        help=(
+            "Elephant flow count directory to include (can be provided multiple times). "
+            "Default: 4 (normal.py default)."
+        ),
+    )
+    parser.add_argument(
+        "--congestion-rate",
+        dest="congestion_rate",
+        action="append",
+        help=(
+            "Congestion-rate directory name(s) to include (raw string, can be provided multiple times). "
+            "Default: 0.2 (normal.py default)."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -206,6 +244,8 @@ def plot_mouse_fct_cdf(
     mark_outliers: bool = False,
 ) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
+    unit_label = "ms" if exclude_outliers else "s"
+    scale = 1000.0 if exclude_outliers else 1.0
     has_data = False
     for proto in protos:
         subset = mouse_df[mouse_df["proto"] == proto]
@@ -219,206 +259,44 @@ def plot_mouse_fct_cdf(
             had_retrans_all = subset["had_retrans"].to_numpy().astype(bool)
         else:
             had_retrans_all = np.zeros(values_all.shape, dtype=bool)
-        outlier_mask, lower, upper = _outlier_mask(values_all)
-        values = values_all[~outlier_mask] if exclude_outliers else values_all
-        if values.size == 0:
-            logging.warning("All mouse FCT values are outliers for %s", proto)
-            continue
-        line = _plot_cdf(ax, values, proto)
-        color = line.get_color()
-        p50, p90, p99 = np.percentile(values, [50, 90, 99])
-        ax.scatter(
-            [p50, p90, p99],
-            [0.5, 0.9, 0.99],
-            color=color,
-            marker="x",
-            s=25,
-            label=f"{proto} p50/p90/p99",
-        )
-        line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
-        if mark_outliers and not exclude_outliers and outlier_mask.any():
-            sort_idx = np.argsort(values_all)
-            values_sorted = values_all[sort_idx]
-            retrans_sorted = had_retrans_all[sort_idx]
-            y = np.arange(1, len(values_sorted) + 1) / len(values_sorted)
-            sorted_mask = (values_sorted < lower) | (values_sorted > upper)
-            outlier_y = y[sorted_mask]
-            outlier_values = values_sorted[sorted_mask]
-            outlier_retrans = retrans_sorted[sorted_mask]
-            no_retrans_mask = ~outlier_retrans
-            has_retrans_mask = outlier_retrans
-            if np.any(no_retrans_mask):
-                ax.scatter(
-                    outlier_values[no_retrans_mask],
-                    outlier_y[no_retrans_mask],
-                    facecolors="none",
-                    edgecolors=color,
-                    marker="o",
-                    s=24,
-                    linewidth=1.0,
-                    label=f"{proto} outliers (no retrans)",
-                )
-            if np.any(has_retrans_mask):
-                ax.scatter(
-                    outlier_values[has_retrans_mask],
-                    outlier_y[has_retrans_mask],
-                    facecolors=color,
-                    edgecolors=color,
-                    marker="s",
-                    s=24,
-                    linewidth=0.8,
-                    label=f"{proto} outliers (retrans)",
-                )
-        has_data = True
-
-    if not has_data:
-        ax.text(0.5, 0.5, "No mouse data", ha="center", va="center")
-    else:
-        ax.set_xlabel("FCT (s)")
-        ax.set_ylabel("CDF")
-        title = "Mouse FCT CDF"
         if exclude_outliers:
-            title += " (outliers removed, 1.5x IQR)"
-        ax.set_title(title)
-        ax.grid(True, linestyle="--", alpha=0.4)
-        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
-    fig.tight_layout(rect=[0, 0, 0.8, 1])
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_mouse_fct_histogram(
-    mouse_df: pd.DataFrame,
-    output_path: Path,
-    protos: Sequence[str],
-    *,
-    exclude_outliers: bool = False,
-    mark_outliers: bool = False,
-) -> None:
-    fig, ax = plt.subplots(figsize=(6, 4))
-    required_cols = {"proto", "fct_s"}
-    if mouse_df.empty or not required_cols.issubset(mouse_df.columns):
-        ax.text(0.5, 0.5, "No mouse data", ha="center", va="center")
-        fig.tight_layout()
-        fig.savefig(output_path, dpi=200)
-        plt.close(fig)
-        return
-
-    values_by_proto: Dict[str, np.ndarray] = {}
-    outliers_by_proto: Dict[str, np.ndarray] = {}
-    outlier_retrans_by_proto: Dict[str, np.ndarray] = {}
-    for proto in protos:
-        subset = mouse_df[mouse_df["proto"] == proto]
-        if subset.empty:
-            logging.warning("No mouse FCT data for %s", proto)
-            continue
-        values_all = subset["fct_s"].to_numpy()
-        if values_all.size == 0:
-            continue
-        if "had_retrans" in subset.columns:
-            had_retrans_all = subset["had_retrans"].to_numpy().astype(bool)
+            p99_threshold = np.percentile(values_all, 99)
+            values = values_all[values_all <= p99_threshold]
         else:
-            had_retrans_all = np.zeros(values_all.shape, dtype=bool)
-        outlier_mask, _, _ = _outlier_mask(values_all)
-        outliers_by_proto[proto] = values_all[outlier_mask]
-        outlier_retrans_by_proto[proto] = had_retrans_all[outlier_mask]
-        values = values_all[~outlier_mask] if exclude_outliers else values_all
+            outlier_mask, lower, upper = _outlier_mask(values_all)
+            values = values_all
         if values.size == 0:
-            logging.warning("All mouse FCT values are outliers for %s", proto)
+            logging.warning("No mouse FCT values <= p99 for %s", proto)
             continue
-        values_by_proto[proto] = values
-
-    all_values_ms = (
-        np.concatenate([vals * 1000 for vals in values_by_proto.values()])
-        if values_by_proto
-        else np.array([])
-    )
-    bins = (
-        np.histogram_bin_edges(all_values_ms, bins="auto") if all_values_ms.size else None
-    )
-
-    has_data = False
-    percentile_annos: List[Tuple[str, Tuple[float, float, float], Any]] = []
-    outlier_annos: List[Tuple[np.ndarray, Any, str, bool]] = []
-    max_count = 0.0
-
-    for proto in protos:
-        values = values_by_proto.get(proto)
-        if values is None:
-            continue
-        values_ms = values * 1000
-        if values_ms.size == 0:
-            continue
-        counts, _, patches = ax.hist(
-            values_ms,
-            bins=bins if bins is not None and bins.size > 1 else "auto",
-            density=True,
-            alpha=0.65,
-            label=proto,
-            edgecolor="black",
-            linewidth=0.5,
-        )
-        max_count = max(max_count, float(np.max(counts)) if counts.size else 0.0)
-        p50, p90, p99 = np.percentile(values_ms, [50, 90, 99])
-        color = patches[0].get_facecolor() if patches else "C0"
-        label = f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})"
-        if patches:
-            patches[0].set_label(label)
-            for patch in patches[1:]:
-                patch.set_label("_nolegend_")
-        percentile_annos.append((proto, (p50, p90, p99), color))
-        if mark_outliers and not exclude_outliers:
-            outliers = outliers_by_proto.get(proto)
-            outlier_retrans = outlier_retrans_by_proto.get(proto)
-            if outliers is not None and outliers.size and outlier_retrans is not None:
-                no_retrans = outliers[~outlier_retrans]
-                has_retrans = outliers[outlier_retrans]
-                if no_retrans.size:
-                    outlier_annos.append((no_retrans * 1000, color, proto, False))
-                if has_retrans.size:
-                    outlier_annos.append((has_retrans * 1000, color, proto, True))
-        has_data = True
-
-    if not has_data:
-        ax.text(0.5, 0.5, "No mouse data", ha="center", va="center")
-    else:
-        marker_y = max_count * 1.05 if max_count > 0 else 1.0
-        for proto, values, color in percentile_annos:
-            p50, p90, p99 = values
-            ax.vlines(
-                [p50, p90, p99],
-                ymin=0,
-                ymax=marker_y,
-                colors=color,
-                linestyles="--",
-                linewidth=1,
-                alpha=0.8,
-            )
+        label = proto if not exclude_outliers else f"{proto} (<=p99)"
+        line = _plot_cdf(ax, values * scale, label)
+        color = line.get_color()
+        if not exclude_outliers:
+            p50, p90, p99 = np.percentile(values * scale, [50, 90, 99])
             ax.scatter(
                 [p50, p90, p99],
-                [marker_y] * 3,
+                [0.5, 0.9, 0.99],
                 color=color,
                 marker="x",
                 s=25,
                 label=f"{proto} p50/p90/p99",
             )
-        if mark_outliers and not exclude_outliers:
-            for values_ms, color, proto, had_retrans in outlier_annos:
-                if had_retrans:
+            line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
+            if mark_outliers:
+                sort_idx = np.argsort(values_all)
+                values_sorted = values_all[sort_idx]
+                retrans_sorted = had_retrans_all[sort_idx]
+                y = np.arange(1, len(values_sorted) + 1) / len(values_sorted)
+                sorted_mask = (values_sorted < lower) | (values_sorted > upper)
+                outlier_y = y[sorted_mask]
+                outlier_values = values_sorted[sorted_mask] * scale
+                outlier_retrans = retrans_sorted[sorted_mask]
+                no_retrans_mask = ~outlier_retrans
+                has_retrans_mask = outlier_retrans
+                if np.any(no_retrans_mask):
                     ax.scatter(
-                        values_ms,
-                        [marker_y] * len(values_ms),
-                        facecolors=color,
-                        edgecolors=color,
-                        marker="s",
-                        s=24,
-                        linewidth=0.8,
-                        label=f"{proto} outliers (retrans)",
-                    )
-                else:
-                    ax.scatter(
-                        values_ms,
-                        [marker_y] * len(values_ms),
+                        outlier_values[no_retrans_mask],
+                        outlier_y[no_retrans_mask],
                         facecolors="none",
                         edgecolors=color,
                         marker="o",
@@ -426,12 +304,27 @@ def plot_mouse_fct_histogram(
                         linewidth=1.0,
                         label=f"{proto} outliers (no retrans)",
                     )
-        ax.set_ylim(top=marker_y * 1.1)
-        ax.set_xlabel("FCT (ms)")
-        ax.set_ylabel("Density")
-        title = "Mouse FCT Distribution"
+                if np.any(has_retrans_mask):
+                    ax.scatter(
+                        outlier_values[has_retrans_mask],
+                        outlier_y[has_retrans_mask],
+                        facecolors=color,
+                        edgecolors=color,
+                        marker="s",
+                        s=24,
+                        linewidth=0.8,
+                        label=f"{proto} outliers (retrans)",
+                    )
+        has_data = True
+
+    if not has_data:
+        ax.text(0.5, 0.5, "No mouse data", ha="center", va="center")
+    else:
+        ax.set_xlabel(f"FCT ({unit_label})")
+        ax.set_ylabel("CDF")
+        title = "Mouse FCT CDF"
         if exclude_outliers:
-            title += " (outliers removed, 1.5x IQR)"
+            title += " (outliers removed, <=p99)"
         ax.set_title(title)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.legend()
@@ -450,60 +343,6 @@ def _count_true(subset: pd.DataFrame, column: str) -> int:
     if column not in subset.columns:
         return 0
     return int(subset[column].fillna(False).astype(bool).sum())
-
-
-def _compute_link_util_series(link_ts_df: pd.DataFrame) -> pd.DataFrame:
-    if link_ts_df.empty:
-        return pd.DataFrame(
-            columns=["proto", "run_id", "sample_idx", "elapsed_s", "u_mean", "u_max", "cv"]
-        )
-    required = ["proto", "run_id", "sample_idx", "elapsed_s", "u_l"]
-    missing = [col for col in required if col not in link_ts_df.columns]
-    if missing:
-        logging.warning("Link timeseries missing columns: %s", ", ".join(missing))
-        return pd.DataFrame(
-            columns=["proto", "run_id", "sample_idx", "elapsed_s", "u_mean", "u_max", "cv"]
-        )
-
-    df = link_ts_df.copy()
-    df["u_l"] = pd.to_numeric(df["u_l"], errors="coerce")
-    df["elapsed_s"] = pd.to_numeric(df["elapsed_s"], errors="coerce")
-
-    rows: List[Dict[str, object]] = []
-    for (proto, run_id, sample_idx), group in df.groupby(["proto", "run_id", "sample_idx"]):
-        values = group["u_l"].dropna().to_numpy()
-        if values.size == 0:
-            continue
-        elapsed_vals = group["elapsed_s"].dropna().to_numpy()
-        elapsed = float(elapsed_vals.max()) if elapsed_vals.size else float("nan")
-        u_mean = float(values.mean())
-        u_max = float(values.max())
-        cv = float(values.std(ddof=0) / u_mean) if u_mean > 0 else 0.0
-        rows.append(
-            {
-                "proto": proto,
-                "run_id": run_id,
-                "sample_idx": sample_idx,
-                "elapsed_s": elapsed,
-                "u_mean": u_mean,
-                "u_max": u_max,
-                "cv": cv,
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def _u_max_percentiles(util_df: pd.DataFrame) -> Dict[Tuple[str, str], Tuple[float, float]]:
-    percentiles: Dict[Tuple[str, str], Tuple[float, float]] = {}
-    if util_df.empty:
-        return percentiles
-    for (proto, run_id), group in util_df.groupby(["proto", "run_id"]):
-        values = group["u_max"].dropna().to_numpy()
-        if values.size == 0:
-            continue
-        p95, p99 = np.percentile(values, [95, 99])
-        percentiles[(proto, run_id)] = (float(p95), float(p99))
-    return percentiles
 
 
 def _plot_link_series(
@@ -597,6 +436,9 @@ def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
 
+    elephant_filter = args.elephant_num or [DEFAULT_ELEPHANT_NUM]
+    congestion_filter = args.congestion_rate or [DEFAULT_CONGESTION_RATE]
+
     output_dir: Path = OUTPUT_ROOT / args.output_dir_name
     output_dir.mkdir(parents=True, exist_ok=True)
     logging.info("Writing outputs to %s", output_dir)
@@ -608,36 +450,51 @@ def main() -> None:
             PROTO_ORDER,
             args.run_id,
             args.latest_n,
+            elephant_filter,
+            congestion_filter,
         )
     except ValueError as exc:
         logging.error("%s", exc)
         raise SystemExit(1) from exc
-    total_runs = sum(len(v) for v in run_dirs_by_proto.values())
-    if total_runs == 0:
+
+    if all(not combos for combos in run_dirs_by_proto.values()):
         logging.error(
-            "No run directories selected under %s for protocols: %s",
+            "No run directories selected under %s for protocols: %s (elephant=%s, congestion=%s)",
             log_root,
             ", ".join(PROTO_ORDER),
+            ", ".join(map(str, elephant_filter)),
+            ", ".join(congestion_filter),
         )
         return
 
     for proto in PROTO_ORDER:
-        runs = run_dirs_by_proto.get(proto, [])
-        if runs:
-            logging.info(
-                "Using %d run(s) for %s: %s",
-                len(runs),
+        combos = run_dirs_by_proto.get(proto, {})
+        if not combos:
+            logging.warning(
+                "No runs selected for %s under %s (elephant=%s, congestion=%s)",
                 proto,
-                ", ".join(d.name for d in runs),
+                log_root,
+                ", ".join(map(str, elephant_filter)),
+                ", ".join(congestion_filter),
             )
-        else:
-            logging.warning("No runs selected for %s", proto)
-
-    run_list: List[Tuple[str, Path]] = [
-        (f"{proto}:{run_dir.name}", run_dir)
-        for proto in PROTO_ORDER
-        for run_dir in run_dirs_by_proto.get(proto, [])
-    ]
+            continue
+        for (elephant_num, congestion_rate), runs in combos.items():
+            if runs:
+                logging.info(
+                    "Using %d run(s) for %s (E=%s, C=%s): %s",
+                    len(runs),
+                    proto,
+                    elephant_num,
+                    congestion_rate,
+                    ", ".join(d.name for d in runs),
+                )
+            else:
+                logging.warning(
+                    "No runs selected for %s (E=%s, C=%s)",
+                    proto,
+                    elephant_num,
+                    congestion_rate,
+                )
 
     data = collect_all_data(log_root, PROTO_ORDER, run_dirs_by_proto)
     elephant_df = data["elephant"]
@@ -645,87 +502,14 @@ def main() -> None:
     link_df = data["link"]
     link_ts_df = data.get("link_ts", pd.DataFrame())
 
-    if elephant_df.empty and mouse_df.empty and link_df.empty:
-        logging.error("No data found under %s", log_root)
-        return
-
-    fairness_df = compute_fairness(link_df)
-    util_df = _compute_link_util_series(link_ts_df)
-    u_max_percentiles = _u_max_percentiles(util_df)
-
-    plot_fattree_topology(
-        output_dir / f"fattree_topology_k{args.k}.png",
-        k=args.k,
-    )
-    plot_elephant_goodput_bar(
-        elephant_df,
-        output_dir / "normal_elephant_goodput_bar.png",
-        PROTO_ORDER,
-    )
-    plot_elephant_goodput_scatter(
-        elephant_df,
-        output_dir / "normal_elephant_goodput_scatter.png",
-        PROTO_ORDER,
-    )
-    plot_mouse_fct_cdf(
-        mouse_df,
-        output_dir / "normal_mouse_fct_cdf.png",
-        PROTO_ORDER,
-        mark_outliers=True,
-    )
-    plot_mouse_fct_cdf(
-        mouse_df,
-        output_dir / "normal_mouse_fct_cdf_no_outliers.png",
-        PROTO_ORDER,
-        exclude_outliers=True,
-    )
-    plot_run_p99_scatter(
-        mouse_df,
-        output_dir / "normal_mouse_p99_scatter.png",
-        PROTO_ORDER,
-    )
-    plot_mouse_fct_histogram(
-        mouse_df,
-        output_dir / "normal_mouse_fct_hist.png",
-        PROTO_ORDER,
-        mark_outliers=True,
-    )
-    plot_mouse_fct_histogram(
-        mouse_df,
-        output_dir / "normal_mouse_fct_hist_no_outliers.png",
-        PROTO_ORDER,
-        exclude_outliers=True,
-    )
-    if args.heatmap_mode == "pivot":
-        plot_link_heatmap(
-            link_df,
-            output_dir / "normal_link_heatmap.png",
-            PROTO_ORDER,
+    combos = _collect_combos(elephant_df, mouse_df, link_df, link_ts_df)
+    if not combos:
+        logging.error(
+            "No data found under %s for filters elephant=%s, congestion=%s",
+            log_root,
+            ", ".join(map(str, elephant_filter)),
+            ", ".join(congestion_filter),
         )
-    else:
-        plot_fattree_heatmap(
-            link_df,
-            output_dir / "normal_link_heatmap.png",
-            PROTO_ORDER,
-            k=args.k,
-        )
-    plot_link_util_timeseries(
-        util_df,
-        u_max_percentiles,
-        output_dir=output_dir,
-    )
-
-    write_summary(
-        output_dir / "normal_summary.txt",
-        elephant_df,
-        mouse_df,
-        fairness_df,
-        PROTO_ORDER,
-        experiment_label="Normal",
-    )
-
-    if not run_list:
-        logging.warning("No runs available; skipping mouse drop/retrans plots.")
         return
 
     try:
@@ -735,72 +519,166 @@ def main() -> None:
         import mouse_droploss_plot as droploss
         import mouse_retrans_plot as retrans
 
-    droploss_summaries: List[droploss.DropLossSummary] = []
-    for proto in PROTO_ORDER:
-        runs = run_dirs_by_proto.get(proto, [])
-        if not runs:
-            continue
-        subset = _subset_mouse(mouse_df, proto)
-        drop_flows = _count_true(subset, "had_drop_retrans")
-        droploss_summaries.append(
-            droploss.DropLossSummary(
-                label=proto,
-                run_dir=runs[-1],
-                drop_flows=drop_flows,
-                total_flows=len(subset),
-            )
-        )
-    if droploss_summaries:
-        droploss_path = droploss.plot_drop_retrans_ratios(
-            droploss_summaries,
-            output_dir=output_dir,
-            filename=MOUSE_DROPLOSS_FILENAME,
-            title="Mouse drop-induced retransmissions",
-        )
-        drop_flows = sum(s.drop_flows for s in droploss_summaries)
-        total_flows = sum(s.total_flows for s in droploss_summaries)
-        logging.info(
-            "Wrote drop-loss plot to %s (drop-induced retrans flows: %d/%d).",
-            droploss_path,
-            drop_flows,
-            total_flows,
-        )
-    else:
-        logging.warning("No runs available for drop-loss plot.")
+    for elephant_num, congestion_rate in sorted(combos, key=lambda x: (x[0], x[1])):
+        combo_label = f"elephant={elephant_num}, congestion={congestion_rate}"
+        combo_output_dir = output_dir / str(elephant_num) / str(congestion_rate)
+        combo_output_dir.mkdir(parents=True, exist_ok=True)
+        logging.info("Analyzing %s -> %s", combo_label, combo_output_dir)
 
-    retrans_summaries: List[retrans.RetransSummary] = []
-    for proto in PROTO_ORDER:
-        runs = run_dirs_by_proto.get(proto, [])
-        if not runs:
+        elephant_combo = elephant_df[
+            (elephant_df["elephant_num"] == elephant_num)
+            & (elephant_df["congestion_rate"] == congestion_rate)
+        ]
+        mouse_combo = mouse_df[
+            (mouse_df["elephant_num"] == elephant_num)
+            & (mouse_df["congestion_rate"] == congestion_rate)
+        ]
+        link_combo = link_df[
+            (link_df["elephant_num"] == elephant_num)
+            & (link_df["congestion_rate"] == congestion_rate)
+        ]
+        link_ts_combo = link_ts_df[
+            (link_ts_df["elephant_num"] == elephant_num)
+            & (link_ts_df["congestion_rate"] == congestion_rate)
+        ]
+
+        if (
+            elephant_combo.empty
+            and mouse_combo.empty
+            and link_combo.empty
+            and link_ts_combo.empty
+        ):
+            logging.warning("No data available for %s; skipping.", combo_label)
             continue
-        subset = _subset_mouse(mouse_df, proto)
-        retrans_flows = _count_true(subset, "had_retrans")
-        retrans_summaries.append(
-            retrans.RetransSummary(
-                label=proto,
-                run_dir=runs[-1],
-                retrans_flows=retrans_flows,
-                total_flows=len(subset),
+
+        fairness_df = compute_fairness(link_combo)
+        util_df = compute_link_util_series(link_ts_combo)
+        u_max_percentiles = compute_u_max_percentiles(util_df)
+
+        plot_fattree_topology(
+            combo_output_dir / f"fattree_topology_k{args.k}.png",
+            k=args.k,
+        )
+        plot_elephant_goodput_bar(
+            elephant_combo,
+            combo_output_dir / "normal_elephant_goodput_bar.png",
+            PROTO_ORDER,
+        )
+        plot_elephant_goodput_scatter(
+            elephant_combo,
+            combo_output_dir / "normal_elephant_goodput_scatter.png",
+            PROTO_ORDER,
+        )
+        plot_mouse_fct_cdf(
+            mouse_combo,
+            combo_output_dir / "normal_mouse_fct_cdf.png",
+            PROTO_ORDER,
+            mark_outliers=True,
+        )
+        plot_mouse_fct_cdf(
+            mouse_combo,
+            combo_output_dir / "normal_mouse_fct_cdf_no_outliers.png",
+            PROTO_ORDER,
+            exclude_outliers=True,
+        )
+        plot_run_p99_scatter(
+            mouse_combo,
+            combo_output_dir / "normal_mouse_p99_scatter.png",
+            PROTO_ORDER,
+        )
+        if args.heatmap_mode == "pivot":
+            plot_link_heatmap(
+                link_combo,
+                combo_output_dir / "normal_link_heatmap.png",
+                PROTO_ORDER,
             )
+        else:
+            plot_fattree_heatmap(
+                link_combo,
+                combo_output_dir / "normal_link_heatmap.png",
+                PROTO_ORDER,
+                k=args.k,
+            )
+        plot_link_util_timeseries(
+            util_df,
+            u_max_percentiles,
+            output_root=combo_output_dir,
         )
 
-    if retrans_summaries:
-        retrans_path = retrans.plot_retrans_ratios(
-            retrans_summaries,
-            output_dir=output_dir,
-            filename=MOUSE_RETRANS_FILENAME,
-            title="Mouse retransmission ratio",
+        write_summary(
+            combo_output_dir / "normal_summary.txt",
+            elephant_combo,
+            mouse_combo,
+            fairness_df,
+            PROTO_ORDER,
+            experiment_label=f"Normal (E={elephant_num}, C={congestion_rate})",
         )
-        retrans_flows = sum(s.retrans_flows for s in retrans_summaries)
-        total_flows = sum(s.total_flows for s in retrans_summaries)
-        logging.info(
-            "Wrote retrans plot to %s (flows with retrans: %d/%d).",
-            retrans_path,
-            retrans_flows,
-            total_flows,
-        )
-    else:
-        logging.warning("No runs available for retrans plot.")
+
+        droploss_summaries: List[droploss.DropLossSummary] = []
+        retrans_summaries: List[retrans.RetransSummary] = []
+        for proto in PROTO_ORDER:
+            runs = run_dirs_by_proto.get(proto, {}).get(
+                (elephant_num, congestion_rate), []
+            )
+            if not runs:
+                continue
+            subset = _subset_mouse(mouse_combo, proto)
+            drop_flows = _count_true(subset, "had_drop_retrans")
+            retrans_flows = _count_true(subset, "had_retrans")
+            droploss_summaries.append(
+                droploss.DropLossSummary(
+                    label=proto,
+                    run_dir=runs[-1],
+                    drop_flows=drop_flows,
+                    total_flows=len(subset),
+                )
+            )
+            retrans_summaries.append(
+                retrans.RetransSummary(
+                    label=proto,
+                    run_dir=runs[-1],
+                    retrans_flows=retrans_flows,
+                    total_flows=len(subset),
+                )
+            )
+
+        if droploss_summaries:
+            droploss_path = droploss.plot_drop_retrans_ratios(
+                droploss_summaries,
+                output_dir=combo_output_dir,
+                filename=MOUSE_DROPLOSS_FILENAME,
+                title="Mouse drop-induced retransmissions",
+            )
+            drop_flows = sum(s.drop_flows for s in droploss_summaries)
+            total_flows = sum(s.total_flows for s in droploss_summaries)
+            logging.info(
+                "Wrote drop-loss plot for %s to %s (drop-induced retrans flows: %d/%d).",
+                combo_label,
+                droploss_path,
+                drop_flows,
+                total_flows,
+            )
+        else:
+            logging.warning("No runs available for drop-loss plot (%s).", combo_label)
+
+        if retrans_summaries:
+            retrans_path = retrans.plot_retrans_ratios(
+                retrans_summaries,
+                output_dir=combo_output_dir,
+                filename=MOUSE_RETRANS_FILENAME,
+                title="Mouse retransmission ratio",
+            )
+            retrans_flows = sum(s.retrans_flows for s in retrans_summaries)
+            total_flows = sum(s.total_flows for s in retrans_summaries)
+            logging.info(
+                "Wrote retrans plot for %s to %s (flows with retrans: %d/%d).",
+                combo_label,
+                retrans_path,
+                retrans_flows,
+                total_flows,
+            )
+        else:
+            logging.warning("No runs available for retrans plot (%s).", combo_label)
 
 
 if __name__ == "__main__":

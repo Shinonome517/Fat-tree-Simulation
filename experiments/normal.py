@@ -730,7 +730,13 @@ def run_normal_once(
     )
 
     log_root = Path("logs") / LOG_ROOT_NAME / (output_subdir or Path("default"))
-    log_dir = make_log_dir(LOG_ROOT_NAME, proto, log_root=log_root, suffix=f"seed{seed}")
+    log_dir = make_log_dir(
+        LOG_ROOT_NAME,
+        proto,
+        log_root=log_root,
+        suffix=f"seed{seed}",
+        extra_parts=[str(elephant_num), str(elephant_congestion_rate)],
+    )
 
     ctx = None
     server_procs: List[object] = []
@@ -1068,7 +1074,8 @@ def main() -> None:
         default=Path("default"),
         help=(
             "Subdirectory name under logs/normal. Each run writes to "
-            "logs/normal/<output-dir>/<proto>/run_<timestamp>_seed<seed> (default: default)."
+            "logs/normal/<output-dir>/<proto>/<elephant-num>/<congestion-rate>/"
+            "run_<timestamp>_seed<seed+run_index> (default: default)."
         ),
     )
     parser.add_argument(
