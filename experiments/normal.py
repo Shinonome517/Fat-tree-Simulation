@@ -746,6 +746,13 @@ def run_normal_once(
     mouse_stop = threading.Event()
     all_mouse_procs: List[object] = []
     link_sampler: Optional[LinkSampler] = None
+    def _ensure_servers_alive(context: str) -> None:
+        dead = [proc for proc in server_procs if proc and proc.poll() is not None]
+        if dead:
+            raise RuntimeError(
+                f"Server process died {context}; see server logs under {log_dir} "
+                f"(elephant_server_*.log / mouse_server_*.log)."
+            )
 
     try:
         ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=50)
@@ -930,6 +937,7 @@ def run_normal_once(
                 log_dir=log_dir,
                 run_tag=run_tag,
             )
+        _ensure_servers_alive("after healthcheck")
 
         link_sampler = LinkSampler(
             ctx,
@@ -947,6 +955,7 @@ def run_normal_once(
         (log_dir / "switch_stats_before.json").write_text(
             json.dumps(before_stats, indent=2)
         )
+        _ensure_servers_alive("after warmup")
         link_sampler.start()
 
         start_time = time.time()

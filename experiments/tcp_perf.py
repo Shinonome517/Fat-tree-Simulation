@@ -36,14 +36,17 @@ def _make_socket(proto: str) -> socket.socket:
 
 def run_server(bind_ip: str, port: int, backlog: int, proto: str) -> int:
     srv = _make_socket(proto)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except OSError:
+        # Best-effort; continue even if this fails on some stacks.
+        pass
     srv.bind((bind_ip, port))
     srv.listen(backlog)
     print(f"[tcp_perf] listening on {bind_ip}:{port} ({proto}, backlog={backlog})")
     try:
         while True:
             conn, addr = srv.accept()
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 while True:
                     data = conn.recv(DEFAULT_CHUNK_SIZE)
@@ -58,6 +61,9 @@ def run_server(bind_ip: str, port: int, backlog: int, proto: str) -> int:
                     pass
     except KeyboardInterrupt:
         pass
+    except OSError as exc:
+        print(f"[tcp_perf] server error ({proto}): {exc}", file=sys.stderr)
+        return 1
     finally:
         try:
             srv.close()
