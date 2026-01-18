@@ -35,12 +35,11 @@ DEFAULT_KILL_GRACE_SECONDS = 3.0  # grace before SIGKILL when stopping processes
 SERVER_IDLE_TIMEOUT_MS = 5000
 CONGESTION_CONTROL = "cubic"
 PROTO_CHOICES = ("quic", "mpquic", "tcp", "mptcp")
-ROLE_MODE_CHOICES = ("mixed", "split")
 LOG_ROOT_NAME = "normal"
 TCP_PERF_PATH = Path(__file__).resolve().parent / "tcp_perf.py"
 PYTHON_BIN = "/usr/bin/python3"  # Use absolute python path inside Mininet hosts.
 LINK_SAMPLE_INTERVAL_S = 0.1
-WARMUP_SECONDS = 2.0
+WARMUP_SECONDS = 1.0
 DEFAULT_DURATION_SECONDS = 30.0
 DEFAULT_ELEPHANT_CONGESTION_RATE = 0.2  # fraction of 1 Gbps per Elephant flow
 
@@ -499,19 +498,6 @@ def _pick_random_pairs(
     return pairs
 
 
-def _split_sender_pools(hosts: Sequence, rng: Optional[random.Random] = None) -> Tuple[List, List]:
-    """
-    Split hosts into two non-empty, disjoint pools for Elephant/Mouse senders.
-    Falls back to mixed use if hosts are insufficient.
-    """
-    hosts_copy = list(hosts)
-    if len(hosts_copy) < 2:
-        return hosts_copy, hosts_copy
-    (rng or random).shuffle(hosts_copy)
-    mid = max(1, min(len(hosts_copy) - 1, len(hosts_copy) // 2))
-    return hosts_copy[:mid], hosts_copy[mid:]
-
-
 def _pick_cross_pod_pairs(
     hosts: Sequence,
     count: int,
@@ -556,6 +542,85 @@ def _pick_cross_pod_pairs(
         src = rng.choice(src_hosts)
         dst = rng.choice(dst_hosts)
         pairs.append((src, dst))
+    return pairs
+
+
+def _pick_cross_pod_pairs_unique_hosts(
+    hosts: Sequence,
+    count: int,
+    host_coord_map: Dict[object, Tuple[int, int, int]],
+    src_pool: Optional[Sequence] = None,
+    dst_pool: Optional[Sequence] = None,
+    rng: Optional[random.Random] = None,
+) -> List[Tuple]:
+    """
+    Select src/dst pairs across pods with globally unique hosts.
+    Raises RuntimeError if the requested count cannot be satisfied.
+    """
+    if count <= 0:
+        return []
+    if len(hosts) < 2 or not host_coord_map:
+        raise RuntimeError("Unable to select elephant pairs: insufficient hosts.")
+
+    rng = rng or random
+    src_candidates_raw = list(src_pool) if src_pool is not None else list(hosts)
+    dst_candidates_raw = list(dst_pool) if dst_pool is not None else list(hosts)
+
+    def _dedup(seq: List[object]) -> List[object]:
+        seen = set()
+        out: List[object] = []
+        for h in seq:
+            if h in seen:
+                continue
+            if h not in host_coord_map:
+                continue
+            out.append(h)
+            seen.add(h)
+        return out
+
+    src_candidates = _dedup(src_candidates_raw)
+    dst_candidates = _dedup(dst_candidates_raw)
+
+    if len(src_candidates) < count or len(dst_candidates) < count:
+        raise RuntimeError(
+            f"Unable to select {count} elephant pairs: need at least {count} unique "
+            f"senders and receivers (have {len(src_candidates)} senders, {len(dst_candidates)} receivers)."
+        )
+
+    src_candidates.sort(key=lambda h: h.name)
+    dst_candidates.sort(key=lambda h: h.name)
+    rng.shuffle(src_candidates)
+    rng.shuffle(dst_candidates)
+
+    pairs: List[Tuple] = []
+    used_src = set()
+    used_dst = set()
+
+    for src in src_candidates:
+        if len(pairs) >= count:
+            break
+        if src in used_src:
+            continue
+        src_pod = host_coord_map.get(src, (None, None, None))[0]
+        dst_choices = [
+            dst
+            for dst in dst_candidates
+            if dst not in used_dst
+            and dst != src
+            and host_coord_map.get(dst, (None, None, None))[0] != src_pod
+        ]
+        if not dst_choices:
+            continue
+        dst = rng.choice(dst_choices)
+        used_src.add(src)
+        used_dst.add(dst)
+        pairs.append((src, dst))
+
+    if len(pairs) < count:
+        raise RuntimeError(
+            f"Unable to select {count} elephant pairs with unique hosts across pods; "
+            f"selected {len(pairs)}."
+        )
     return pairs
 
 
@@ -739,7 +804,6 @@ def run_normal_once(
     elephant_num: int,
     enable_qlog: bool = False,
     output_subdir: Optional[Path] = None,
-    role_mode: str = "mixed",
 ) -> None:
     """Execute one normal experiment run."""
     seed = base_seed + run_index
@@ -780,19 +844,11 @@ def run_normal_once(
         print(f"{run_tag} hosts ready: {len(hosts_flat)} total.")
         _apply_tcp_sysctls(hosts_flat, proto)
 
-        if role_mode not in ROLE_MODE_CHOICES:
-            raise ValueError(f"role_mode must be one of {ROLE_MODE_CHOICES}")
-        if role_mode == "split":
-            ele_src_pool, mouse_src_pool = _split_sender_pools(hosts_flat, rng=rng)
-            if not ele_src_pool or not mouse_src_pool:
-                print(f"{run_tag} warning: unable to split sender pools; falling back to mixed.")
-                ele_src_pool = mouse_src_pool = hosts_flat
-        else:
-            ele_src_pool = mouse_src_pool = hosts_flat
+        ele_src_pool = mouse_src_pool = hosts_flat
 
         host_coord_map = _build_host_coord_map(ctx)
 
-        elephant_pairs = _pick_cross_pod_pairs(
+        elephant_pairs = _pick_cross_pod_pairs_unique_hosts(
             hosts_flat,
             elephant_num,
             host_coord_map,
@@ -800,13 +856,6 @@ def run_normal_once(
             dst_pool=hosts_flat,
             rng=rng,
         )
-        if len(elephant_pairs) < elephant_num:
-            print(
-                f"{run_tag} warning: cross-pod elephant selection yielded {len(elephant_pairs)} pairs; falling back to random."
-            )
-            elephant_pairs = _pick_random_pairs(
-                hosts_flat, elephant_num, src_pool=ele_src_pool, rng=rng
-            )
 
         mouse_pairs = _pick_cross_pod_pairs(
             hosts_flat,
@@ -1132,12 +1181,6 @@ def main() -> None:
         action="store_true",
         help="Enable picoquicdemo -l qlog capture for servers (default: disabled for performance).",
     )
-    parser.add_argument(
-        "--role-mode",
-        choices=list(ROLE_MODE_CHOICES),
-        default="mixed",
-        help="Sender role selection: 'split' uses disjoint Elephant/Mouse source pools, 'mixed' allows overlap.",
-    )
     args = parser.parse_args()
 
     for run_idx in range(args.runs):
@@ -1152,7 +1195,6 @@ def main() -> None:
             elephant_num=args.elephant_num,
             enable_qlog=args.enable_qlog,
             output_subdir=args.output_dir,
-            role_mode=args.role_mode,
         )
 
 
