@@ -51,7 +51,11 @@ TCP_SYSCTL_SETTINGS = {
     "net.ipv4.tcp_fin_timeout": "10",
     "net.core.somaxconn": "65535",
     "net.ipv4.tcp_max_syn_backlog": "65535",
+    "net.ipv4.tcp_sack": "1",
+    "net.ipv4.tcp_dsack": "1",
 }
+TCP_ELEPHANT_CHUNK_SIZE = 1024 * 1024
+TCP_MOUSE_CHUNK_SIZE = 64 * 1024
 
 # Experiment parameters.
 MOUSE_PAIR_COUNT = 10
@@ -143,8 +147,10 @@ def _start_picoquic_server(
     return proc
 
 
-def _tcp_perf_server_cmd(port: int, proto: str, bind_ip: str = "0.0.0.0") -> List[str]:
-    return [
+def _tcp_perf_server_cmd(
+    port: int, proto: str, bind_ip: str = "0.0.0.0", chunk_size: Optional[int] = None
+) -> List[str]:
+    cmd = [
         PYTHON_BIN,
         str(TCP_PERF_PATH),
         "server",
@@ -155,12 +161,20 @@ def _tcp_perf_server_cmd(port: int, proto: str, bind_ip: str = "0.0.0.0") -> Lis
         "--port",
         str(port),
     ]
+    if chunk_size is not None:
+        cmd += ["--chunk-size", str(chunk_size)]
+    return cmd
 
 
 def _tcp_perf_client_cmd(
-    server_ip: str, port: int, payload_bytes: int, csv_path: Path, proto: str
+    server_ip: str,
+    port: int,
+    payload_bytes: int,
+    csv_path: Path,
+    proto: str,
+    chunk_size: Optional[int] = None,
 ) -> List[str]:
-    return [
+    cmd = [
         "python3",
         str(TCP_PERF_PATH),
         "client",
@@ -175,6 +189,9 @@ def _tcp_perf_client_cmd(
         "--csv",
         str(csv_path),
     ]
+    if chunk_size is not None:
+        cmd += ["--chunk-size", str(chunk_size)]
+    return cmd
 
 
 def _verify_udp_servers(hosts: Iterable, port: int, label: str) -> None:
@@ -553,6 +570,7 @@ def _mouse_generator(
     proc_store: List[object],
     extra_args: List[str],
     proto: str,
+    chunk_size: int,
     run_tag: str,
     pair_lambda: float,
     rng: random.Random,
@@ -599,6 +617,7 @@ def _mouse_generator(
                 payload_bytes=size_bytes,
                 csv_path=csv_path,
                 proto=proto,
+                chunk_size=chunk_size,
             )
         proc = src_host.popen(mouse_cmd, shell=False)
         proc_store.append(proc)
@@ -694,6 +713,7 @@ def _healthcheck(
             payload_bytes=1024,
             csv_path=csv_tmp,
             proto=proto,
+            chunk_size=TCP_MOUSE_CHUNK_SIZE if label == "mouse" else TCP_ELEPHANT_CHUNK_SIZE,
         )
         hc_out_raw = client_host.cmd(" ".join(shlex.quote(c) for c in hc_cmd) + "; echo HC_RC=$?")
         _log(f"[health:{label}] {proto} ->\n{hc_out_raw.strip()}")
@@ -869,7 +889,7 @@ def run_normal_once(
             for host in elephant_server_hosts:
                 log_path = log_dir / f"elephant_server_{host.name}.log"
                 proc = host.popen(
-                    _tcp_perf_server_cmd(ELEPHANT_PORT, proto),
+                    _tcp_perf_server_cmd(ELEPHANT_PORT, proto, chunk_size=TCP_ELEPHANT_CHUNK_SIZE),
                     stdout=log_path.open("w"),
                     stderr=subprocess.STDOUT,
                     shell=False,
@@ -878,7 +898,7 @@ def run_normal_once(
             for host in mouse_server_hosts:
                 log_path = log_dir / f"mouse_server_{host.name}.log"
                 proc = host.popen(
-                    _tcp_perf_server_cmd(MOUSE_PORT, mouse_proto),
+                    _tcp_perf_server_cmd(MOUSE_PORT, mouse_proto, chunk_size=TCP_MOUSE_CHUNK_SIZE),
                     stdout=log_path.open("w"),
                     stderr=subprocess.STDOUT,
                     shell=False,
@@ -987,6 +1007,7 @@ def run_normal_once(
                     payload_bytes=elephant_target_bytes,
                     csv_path=csv_path,
                     proto=proto,
+                    chunk_size=TCP_ELEPHANT_CHUNK_SIZE,
                 )
             proc = src.popen(elephant_cmd, shell=False)
             elephant_procs.append(proc)
@@ -1010,6 +1031,7 @@ def run_normal_once(
                     proc_list,
                     mouse_extra,
                     mouse_proto,
+                    TCP_MOUSE_CHUNK_SIZE,
                     run_tag,
                     mouse_lambda_per_pair,
                     mouse_rng,

@@ -108,9 +108,10 @@ def _drain_connection(conn: socket.socket, buf_size: int) -> None:
             pass
 
 
-def run_server(bind_ip: str, port: int, backlog: int, proto: str) -> int:
+def run_server(bind_ip: str, port: int, backlog: int, proto: str, chunk_size: int) -> int:
     srv = _make_socket(proto)
     ssl_ctx = _server_ssl_context()
+    chunk_size = max(int(chunk_size), 1)
     try:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     except OSError:
@@ -118,7 +119,7 @@ def run_server(bind_ip: str, port: int, backlog: int, proto: str) -> int:
         pass
     srv.bind((bind_ip, port))
     srv.listen(backlog)
-    print(f"[tcp_perf] listening on {bind_ip}:{port} ({proto}, backlog={backlog})")
+    print(f"[tcp_perf] listening on {bind_ip}:{port} ({proto}, backlog={backlog}, chunk_size={chunk_size})")
     try:
         while True:
             conn, addr = srv.accept()
@@ -133,7 +134,7 @@ def run_server(bind_ip: str, port: int, backlog: int, proto: str) -> int:
                 continue
             try:
                 thread = threading.Thread(
-                    target=_drain_connection, args=(tls_conn, DEFAULT_CHUNK_SIZE), daemon=True
+                    target=_drain_connection, args=(tls_conn, chunk_size), daemon=True
                 )
                 thread.start()
             except Exception:
@@ -164,9 +165,17 @@ def _write_csv(csv_path: Path, duration: float, sent: int, received: int) -> Non
         writer.writerow([f"{duration:.6f}", sent, received, 0, 0, 0])
 
 
-def run_client(host: str, port: int, payload_bytes: int, csv_path: Path, proto: str) -> int:
+def run_client(
+    host: str,
+    port: int,
+    payload_bytes: int,
+    csv_path: Path,
+    proto: str,
+    chunk_size: int,
+) -> int:
     sock = _make_socket(proto)
     ssl_ctx = _client_ssl_context()
+    chunk_size = max(int(chunk_size), 1)
     sent = 0
     received = 0
     total_retrans = 0
@@ -185,7 +194,7 @@ def run_client(host: str, port: int, payload_bytes: int, csv_path: Path, proto: 
         except OSError:
             pass
 
-        buf = bytearray(DEFAULT_CHUNK_SIZE)
+        buf = bytearray(chunk_size)
         view = memoryview(buf)
         remaining = payload_bytes
         while remaining > 0:
@@ -238,6 +247,12 @@ def parse_args() -> argparse.Namespace:
     srv.add_argument("--port", type=int, required=True)
     srv.add_argument("--backlog", type=int, default=65535)
     srv.add_argument("--proto", choices=["tcp", "mptcp"], default="tcp")
+    srv.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Byte size for application recv buffer per connection.",
+    )
 
     cli = sub.add_parser("client", help="Run as TCP/MPTCP client.")
     cli.add_argument("--host", required=True)
@@ -245,6 +260,12 @@ def parse_args() -> argparse.Namespace:
     cli.add_argument("--bytes", type=int, required=True, dest="payload_bytes")
     cli.add_argument("--csv", type=Path, required=True)
     cli.add_argument("--proto", choices=["tcp", "mptcp"], default="tcp")
+    cli.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Byte size for send loop chunks.",
+    )
 
     return parser.parse_args()
 
@@ -252,9 +273,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.mode == "server":
-        rc = run_server(args.bind, args.port, args.backlog, args.proto)
+        rc = run_server(args.bind, args.port, args.backlog, args.proto, args.chunk_size)
     else:
-        rc = run_client(args.host, args.port, args.payload_bytes, args.csv, args.proto)
+        rc = run_client(
+            args.host, args.port, args.payload_bytes, args.csv, args.proto, args.chunk_size
+        )
     sys.exit(rc)
 
 
