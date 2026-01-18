@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
@@ -43,6 +44,8 @@ MOUSE_DROPLOSS_FILENAME = "normal_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "normal_mouse_retrans_ratio.png"
 LINK_UTIL_SUBDIR = Path("link_utilization")
 DEFAULT_ELEPHANT_NUM = 4
+MOUSE_EXCLUDE_HEAD_S = 1.0
+MOUSE_EXCLUDE_TAIL_S = 1.0
 
 
 def _positive_int(value: str) -> int:
@@ -55,6 +58,16 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid float: {value}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Value must be a positive number.")
+    return parsed
+
+
 def _collect_combos(*dfs: pd.DataFrame) -> set[tuple[int, str]]:
     combos: set[tuple[int, str]] = set()
     for df in dfs:
@@ -64,6 +77,20 @@ def _collect_combos(*dfs: pd.DataFrame) -> set[tuple[int, str]]:
             continue
         combos.update(zip(df["elephant_num"], df["elephant_MBytes"]))
     return combos
+
+
+def _split_pair_id(pair_id: Any) -> tuple[str | None, int | None]:
+    if not isinstance(pair_id, str):
+        return None, None
+    parts = pair_id.split("_", 1)
+    pair_label = parts[0] if parts else None
+    seq: int | None = None
+    if len(parts) == 2:
+        try:
+            seq = int(parts[1])
+        except ValueError:
+            seq = None
+    return pair_label, seq
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         choices=["graph", "pivot"],
         default="graph",
         help="Heatmap style: 'graph' overlays on fat-tree, 'pivot' keeps the original matrix view.",
+    )
+    parser.add_argument(
+        "--mouse-lambda",
+        type=_positive_float,
+        required=True,
+        help="Mouse flow generation rate for the experiment (Poisson mean, flows/s).",
     )
     return parser.parse_args()
 
@@ -339,6 +372,93 @@ def _subset_mouse(mouse_df: pd.DataFrame, proto: str) -> pd.DataFrame:
     return mouse_df[mouse_df["proto"] == proto]
 
 
+def _exclude_mouse_warmup_tail(
+    mouse_df: pd.DataFrame,
+    mouse_lambda_total: float,
+    *,
+    warmup_s: float,
+    tail_s: float,
+) -> pd.DataFrame:
+    """
+    Remove flows that likely fall into the warmup and tail windows by using the
+    Poisson arrival expectation and per-pair sequence numbers.
+    """
+    if mouse_df.empty:
+        return mouse_df
+    if "pair_id" not in mouse_df.columns:
+        logging.warning("pair_id column missing in mouse_df; skipping warmup/tail exclusion.")
+        return mouse_df
+
+    pair_labels, pair_seqs = zip(*mouse_df["pair_id"].map(_split_pair_id))
+    df = mouse_df.copy()
+    df["_pair_label"] = pair_labels
+    df["_flow_seq"] = pd.to_numeric(pair_seqs, errors="coerce")
+    mask = pd.Series(True, index=df.index)
+
+    for (proto, run_id, elephant_num, elephant_MBytes), group in df.groupby(
+        ["proto", "run_id", "elephant_num", "elephant_MBytes"],
+        sort=False,
+    ):
+        labels = [p for p in group["_pair_label"].unique() if isinstance(p, str)]
+        pair_count = len(labels)
+        if pair_count == 0:
+            logging.warning(
+                "Unable to infer mouse pairs for %s run %s (E=%s, M=%s); keeping all flows.",
+                proto,
+                run_id,
+                elephant_num,
+                elephant_MBytes,
+            )
+            continue
+
+        lambda_per_pair = mouse_lambda_total / pair_count
+        head_drop_target = math.ceil(lambda_per_pair * warmup_s) if warmup_s > 0 else 0
+        tail_drop_target = math.ceil(lambda_per_pair * tail_s) if tail_s > 0 else 0
+        dropped = 0
+
+        for pair_label in labels:
+            pair_group = group[group["_pair_label"] == pair_label]
+            if pair_group.empty:
+                continue
+            if pair_group["_flow_seq"].notna().any():
+                pair_group = pair_group.sort_values("_flow_seq", na_position="last")
+            else:
+                logging.warning(
+                    "Missing sequence numbers for pair %s in %s run %s (E=%s, M=%s); skipping warmup/tail exclusion for this pair.",
+                    pair_label,
+                    proto,
+                    run_id,
+                    elephant_num,
+                    elephant_MBytes,
+                )
+                continue
+
+            head_drop = min(head_drop_target, len(pair_group))
+            tail_drop = min(tail_drop_target, max(len(pair_group) - head_drop, 0))
+            if head_drop:
+                mask.loc[pair_group.index[:head_drop]] = False
+            if tail_drop:
+                mask.loc[pair_group.index[-tail_drop:]] = False
+            dropped += head_drop + tail_drop
+
+        if dropped:
+            logging.info(
+                "Excluded %d mouse flows for %s run %s (E=%s, M=%s): lambda=%.3f flows/s, pairs=%d, head=%d, tail=%d.",
+                dropped,
+                proto,
+                run_id,
+                elephant_num,
+                elephant_MBytes,
+                mouse_lambda_total,
+                pair_count,
+                head_drop_target,
+                tail_drop_target,
+            )
+
+    filtered = df[mask].drop(columns=["_pair_label", "_flow_seq"])
+    return filtered
+
+
 def _count_valid_true(subset: pd.DataFrame, column: str) -> tuple[int, int]:
     if column not in subset.columns:
         return 0, 0
@@ -502,6 +622,12 @@ def main() -> None:
     data = collect_all_data(log_root, PROTO_ORDER, run_dirs_by_proto)
     elephant_df = data["elephant"]
     mouse_df = data["mouse"]
+    mouse_df = _exclude_mouse_warmup_tail(
+        mouse_df,
+        args.mouse_lambda,
+        warmup_s=MOUSE_EXCLUDE_HEAD_S,
+        tail_s=MOUSE_EXCLUDE_TAIL_S,
+    )
     link_df = data["link"]
     link_ts_df = data.get("link_ts", pd.DataFrame())
 
