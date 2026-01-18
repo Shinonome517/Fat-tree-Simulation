@@ -10,13 +10,25 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ssl
 import socket
+import struct
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Tuple
 
-DEFAULT_CHUNK_SIZE = 64 * 1024
+DEFAULT_CHUNK_SIZE = 1024 * 1024
+PICOQUIC_CERT_PATH = "/etc/picoquic/server-cert.pem"
+PICOQUIC_KEY_PATH = "/etc/picoquic/server-key.pem"
+
+# struct tcp_info (linux/tcp.h) up to tcpi_total_retrans is 104 bytes.
+# We parse only stable early fields to avoid kernel-version sensitivity.
+_TCP_INFO_FMT = "=8B24I"
+_TCP_INFO_LEN = struct.calcsize(_TCP_INFO_FMT)
+_TCP_INFO_LOST_IDX = 8 + 6
+_TCP_INFO_TOTAL_RETRANS_IDX = 8 + 23
 
 
 def _pick_proto(proto: str) -> int:
@@ -34,8 +46,71 @@ def _make_socket(proto: str) -> socket.socket:
         raise SystemExit(f"Failed to create {proto} socket: {exc}") from exc
 
 
+def _server_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    except AttributeError:
+        pass
+    ctx.load_cert_chain(PICOQUIC_CERT_PATH, PICOQUIC_KEY_PATH)
+    return ctx
+
+
+def _client_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    except AttributeError:
+        pass
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _tcp_info_counters(sock: socket.socket) -> Tuple[int, int]:
+    """
+    Best-effort per-connection counters from TCP_INFO.
+
+    Returns (total_retrans, lost). If unavailable, returns (0, 0).
+    """
+    tcp_info_opt = getattr(socket, "TCP_INFO", None)
+    if tcp_info_opt is None:
+        return 0, 0
+    try:
+        raw = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, _TCP_INFO_LEN)
+    except OSError:
+        return 0, 0
+    if len(raw) < _TCP_INFO_LEN:
+        return 0, 0
+    try:
+        vals = struct.unpack(_TCP_INFO_FMT, raw[:_TCP_INFO_LEN])
+    except Exception:
+        return 0, 0
+    lost = int(vals[_TCP_INFO_LOST_IDX])
+    total_retrans = int(vals[_TCP_INFO_TOTAL_RETRANS_IDX])
+    return total_retrans, lost
+
+
+def _drain_connection(conn: socket.socket, buf_size: int) -> None:
+    buf = bytearray(max(int(buf_size), 1))
+    view = memoryview(buf)
+    try:
+        while True:
+            n = conn.recv_into(view)
+            if n <= 0:
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def run_server(bind_ip: str, port: int, backlog: int, proto: str) -> int:
     srv = _make_socket(proto)
+    ssl_ctx = _server_ssl_context()
     try:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     except OSError:
@@ -48,13 +123,20 @@ def run_server(bind_ip: str, port: int, backlog: int, proto: str) -> int:
         while True:
             conn, addr = srv.accept()
             try:
-                while True:
-                    data = conn.recv(DEFAULT_CHUNK_SIZE)
-                    if not data:
-                        break
+                tls_conn = ssl_ctx.wrap_socket(conn, server_side=True)
+            except ssl.SSLError as exc:
+                print(f"[tcp_perf] TLS handshake failed from {addr}: {exc}", file=sys.stderr)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                continue
+            try:
+                thread = threading.Thread(
+                    target=_drain_connection, args=(tls_conn, DEFAULT_CHUNK_SIZE), daemon=True
+                )
+                thread.start()
             except Exception:
-                pass
-            finally:
                 try:
                     conn.close()
                 except Exception:
@@ -76,35 +158,74 @@ def _write_csv(csv_path: Path, duration: float, sent: int, received: int) -> Non
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Duration", "Sent", "Received", "retrans.", "spurious"])
-        writer.writerow([f"{duration:.6f}", sent, received, 0, 0])
+        writer.writerow(
+            ["Duration", "Sent", "Received", "retrans.", "spurious", "lost"]
+        )
+        writer.writerow([f"{duration:.6f}", sent, received, 0, 0, 0])
 
 
 def run_client(host: str, port: int, payload_bytes: int, csv_path: Path, proto: str) -> int:
     sock = _make_socket(proto)
+    ssl_ctx = _client_ssl_context()
     sent = 0
     received = 0
+    total_retrans = 0
+    lost = 0
+    tls_sock: socket.socket | None = None
     start = time.monotonic()
     try:
         sock.connect((host, port))
-        chunk = b"\0" * DEFAULT_CHUNK_SIZE
+        try:
+            tls_sock = ssl_ctx.wrap_socket(sock, server_hostname=None)
+        except ssl.SSLError as exc:
+            raise SystemExit(f"TLS handshake failed: {exc}") from exc
+
+        try:
+            tls_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+        buf = bytearray(DEFAULT_CHUNK_SIZE)
+        view = memoryview(buf)
         remaining = payload_bytes
         while remaining > 0:
-            to_send = min(len(chunk), remaining)
-            sent_now = sock.send(chunk[:to_send])
-            sent += sent_now
-            remaining -= sent_now
+            to_send = min(len(view), remaining)
+            tls_sock.sendall(view[:to_send])
+            sent += to_send
+            remaining -= to_send
         try:
-            sock.shutdown(socket.SHUT_WR)
+            tls_sock.shutdown(socket.SHUT_WR)
         except Exception:
             pass
+        # Wait for peer FIN so Duration better matches "transfer completed" semantics.
+        try:
+            while True:
+                data = tls_sock.recv(1)
+                if not data:
+                    break
+                received += len(data)
+        except Exception:
+            pass
+
+        total_retrans, lost = _tcp_info_counters(tls_sock)
     finally:
+        try:
+            if tls_sock is not None:
+                tls_sock.close()
+        except Exception:
+            pass
         try:
             sock.close()
         except Exception:
             pass
     end = time.monotonic()
-    _write_csv(csv_path, end - start, sent, received)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Duration", "Sent", "Received", "retrans.", "spurious", "lost"])
+        writer.writerow(
+            [f"{(end - start):.6f}", sent, received, total_retrans, 0, lost]
+        )
     return 0
 
 
