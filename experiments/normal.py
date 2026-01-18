@@ -40,8 +40,7 @@ TCP_PERF_PATH = Path(__file__).resolve().parent / "tcp_perf.py"
 PYTHON_BIN = "/usr/bin/python3"  # Use absolute python path inside Mininet hosts.
 LINK_SAMPLE_INTERVAL_S = 0.1
 WARMUP_SECONDS = 1.0
-DEFAULT_DURATION_SECONDS = 30.0
-DEFAULT_ELEPHANT_CONGESTION_RATE = 0.2  # fraction of 1 Gbps per Elephant flow
+ELEPHANT_CLIENT_TIMEOUT_S = 120.0  # watchdog for elephant clients after traffic start
 
 # TCP short-flow survivability (λ=80 flows/s) – intentionally aggressive for the closed DCNW lab.
 TCP_SYSCTL_SETTINGS = {
@@ -83,7 +82,6 @@ ROLE_ELEPHANT_SERVER = "elephant-server"
 ROLE_ELEPHANT_CLIENT = "elephant-client"
 ROLE_MOUSE_SERVER = "mouse-server"
 ROLE_MOUSE_CLIENT = "mouse-client"
-ELEPHANT_MAX_WAIT_PAD_SECONDS = 60.0  # extra wait beyond duration before forcing elephant teardown
 HOSTNAME_RE = re.compile(r"h(\d+)(\d)(\d)$")
 
 
@@ -796,11 +794,9 @@ def _healthcheck(
 def run_normal_once(
     proto: str,
     k: int,
-    duration: float,
     base_seed: int,
     run_index: int,
-    elephant_bytes: Optional[int],
-    elephant_congestion_rate: float,
+    elephant_mbytes: int,
     elephant_num: int,
     enable_qlog: bool = False,
     output_subdir: Optional[Path] = None,
@@ -810,7 +806,7 @@ def run_normal_once(
     rng = random.Random(seed)
     run_tag = f"[run{run_index:04d}]"
     print(
-        f"{run_tag} starting normal run (proto={proto}, k={k}, duration={duration}s, seed={seed}, E={elephant_num}, C={elephant_congestion_rate})"
+        f"{run_tag} starting normal run (proto={proto}, k={k}, seed={seed}, E={elephant_num}, M={elephant_mbytes} MBytes)"
     )
 
     log_root = Path("logs") / LOG_ROOT_NAME / (output_subdir or Path("default"))
@@ -819,7 +815,7 @@ def run_normal_once(
         proto,
         log_root=log_root,
         suffix=f"seed{seed}",
-        extra_parts=[str(elephant_num), str(elephant_congestion_rate)],
+        extra_parts=[str(elephant_num), str(elephant_mbytes)],
     )
 
     ctx = None
@@ -970,15 +966,12 @@ def run_normal_once(
         mouse_extra = (
             get_extra_args(mouse_proto, ROLE_MOUSE_CLIENT) if mouse_proto in ("quic", "mpquic") else []
         )
-        elephant_target_bytes = elephant_bytes
-        if elephant_target_bytes is None:
-            link_bps = DEFAULT_LINK_BW_MBPS * 1_000_000
-            elephant_target_bytes = int(elephant_congestion_rate * link_bps / 8 * duration)
+        elephant_target_bytes = int(elephant_mbytes * 1_000_000)
         if elephant_target_bytes <= 0:
-            raise ValueError("elephant_bytes must be positive when provided or computed.")
+            raise ValueError("elephant bytes must be positive (check --elephant-MBytes).")
         elephant_scenario = f"*1:{elephant_target_bytes}:0;" if proto in ("quic", "mpquic") else None
         with (log_dir / "pair_map.txt").open("a") as f:
-            f.write(f"\nElephant target bytes per flow: {elephant_target_bytes} (C={elephant_congestion_rate})\n")
+            f.write(f"\nElephant target bytes per flow: {elephant_target_bytes} (M={elephant_mbytes} MBytes)\n")
 
         # Pre-flight health checks on one elephant pair and one mouse pair (if present)
         if elephant_pairs:
@@ -1090,8 +1083,8 @@ def run_normal_once(
             mouse_threads.append(thread)
             thread.start()
 
-        print(f"{run_tag} traffic running; waiting for elephant completion.")
-        elephant_deadline = start_time + duration + ELEPHANT_MAX_WAIT_PAD_SECONDS
+        print(f"{run_tag} traffic running; waiting for elephant completion (timeout {ELEPHANT_CLIENT_TIMEOUT_S:.0f}s).")
+        elephant_deadline = start_time + ELEPHANT_CLIENT_TIMEOUT_S
         while time.time() < elephant_deadline:
             if all(proc.poll() is not None for proc in elephant_procs if proc):
                 break
@@ -1103,11 +1096,12 @@ def run_normal_once(
                 print(f"{run_tag} elephant {idx:02d} exited with code {proc.returncode}.")
                 continue
             print(
-                f"{run_tag} elephant {idx:02d} exceeded duration+{ELEPHANT_MAX_WAIT_PAD_SECONDS:.0f}s; sending SIGTERM."
+                f"{run_tag} elephant {idx:02d} exceeded {ELEPHANT_CLIENT_TIMEOUT_S:.0f}s; sending SIGTERM."
             )
             _wait_for_completion_then_terminate(
                 proc,
                 wait_timeout=0.0,
+                term_timeout=1.0,
                 label=f"{run_tag} elephant {idx:02d}",
             )
 
@@ -1146,7 +1140,6 @@ def main() -> None:
     parser.add_argument("--proto", required=True, choices=list(PROTO_CHOICES))
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--k", type=int, default=4)
-    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION_SECONDS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--output-dir",
@@ -1154,21 +1147,16 @@ def main() -> None:
         default=Path("default"),
         help=(
             "Subdirectory name under logs/normal. Each run writes to "
-            "logs/normal/<output-dir>/<proto>/<elephant-num>/<congestion-rate>/"
+            "logs/normal/<output-dir>/<proto>/<elephant-num>/<elephant-MBytes>/"
             "run_<timestamp>_seed<seed+run_index> (default: default)."
         ),
     )
     parser.add_argument(
-        "--elephant-bytes",
+        "--elephant-MBytes",
+        dest="elephant_mbytes",
         type=int,
-        default=None,
-        help="Total payload bytes per Elephant perf scenario; overrides auto-sizing.",
-    )
-    parser.add_argument(
-        "--congestion-rate",
-        type=float,
-        default=DEFAULT_ELEPHANT_CONGESTION_RATE,
-        help="If --elephant-bytes is unset, per-Elephant target load as a fraction of 1 Gbps (default 0.2).",
+        required=True,
+        help="Total payload size per Elephant flow in decimal megabytes (MB = 1,000,000 bytes).",
     )
     parser.add_argument(
         "--elephant-num",
@@ -1183,15 +1171,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.elephant_mbytes <= 0:
+        raise SystemExit("--elephant-MBytes must be > 0")
+
     for run_idx in range(args.runs):
         run_normal_once(
             proto=args.proto,
             k=args.k,
-            duration=args.duration,
             base_seed=args.seed,
             run_index=run_idx,
-            elephant_bytes=args.elephant_bytes,
-            elephant_congestion_rate=args.congestion_rate,
+            elephant_mbytes=args.elephant_mbytes,
             elephant_num=args.elephant_num,
             enable_qlog=args.enable_qlog,
             output_subdir=args.output_dir,

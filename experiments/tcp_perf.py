@@ -26,9 +26,12 @@ PICOQUIC_KEY_PATH = "/etc/picoquic/server-key.pem"
 # struct tcp_info (linux/tcp.h) up to tcpi_total_retrans is 104 bytes.
 # We parse only stable early fields to avoid kernel-version sensitivity.
 _TCP_INFO_FMT = "=8B24I"
-_TCP_INFO_LEN = struct.calcsize(_TCP_INFO_FMT)
+_TCP_INFO_BASE_LEN = struct.calcsize(_TCP_INFO_FMT)
 _TCP_INFO_LOST_IDX = 8 + 6
 _TCP_INFO_TOTAL_RETRANS_IDX = 8 + 23
+_TCP_INFO_REQ_LEN = 256  # Large enough to include tcpi_dsack_dups on modern kernels.
+_TCP_INFO_DSACK_DUPS_OFFSET = 224  # tcpi_dsack_dups sits after tcpi_bytes_retrans.
+_TCP_INFO_DSACK_DUPS_LEN = 4
 
 
 def _pick_proto(proto: str) -> int:
@@ -67,28 +70,38 @@ def _client_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def _tcp_info_counters(sock: socket.socket) -> Tuple[int, int]:
+def _tcp_info_counters(sock: socket.socket) -> Tuple[int, int, int | None]:
     """
     Best-effort per-connection counters from TCP_INFO.
 
-    Returns (total_retrans, lost). If unavailable, returns (0, 0).
+    Returns (total_retrans, lost, dsack_dups). If unavailable, dsack_dups is None.
     """
     tcp_info_opt = getattr(socket, "TCP_INFO", None)
     if tcp_info_opt is None:
-        return 0, 0
+        return 0, 0, None
     try:
-        raw = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, _TCP_INFO_LEN)
+        raw = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, _TCP_INFO_REQ_LEN)
     except OSError:
-        return 0, 0
-    if len(raw) < _TCP_INFO_LEN:
-        return 0, 0
+        return 0, 0, None
+    if len(raw) < _TCP_INFO_BASE_LEN:
+        return 0, 0, None
     try:
-        vals = struct.unpack(_TCP_INFO_FMT, raw[:_TCP_INFO_LEN])
+        vals = struct.unpack(_TCP_INFO_FMT, raw[:_TCP_INFO_BASE_LEN])
     except Exception:
-        return 0, 0
+        return 0, 0, None
     lost = int(vals[_TCP_INFO_LOST_IDX])
     total_retrans = int(vals[_TCP_INFO_TOTAL_RETRANS_IDX])
-    return total_retrans, lost
+    dsack_dups: int | None = None
+    if len(raw) >= (_TCP_INFO_DSACK_DUPS_OFFSET + _TCP_INFO_DSACK_DUPS_LEN):
+        try:
+            dsack_dups = int(
+                struct.unpack_from(
+                    "=I", raw, _TCP_INFO_DSACK_DUPS_OFFSET
+                )[0]
+            )
+        except Exception:
+            dsack_dups = None
+    return total_retrans, lost, dsack_dups
 
 
 def _drain_connection(conn: socket.socket, buf_size: int) -> None:
@@ -180,6 +193,7 @@ def run_client(
     received = 0
     total_retrans = 0
     lost = 0
+    dsack_dups: int | None = None
     tls_sock: socket.socket | None = None
     start = time.monotonic()
     try:
@@ -216,7 +230,7 @@ def run_client(
         except Exception:
             pass
 
-        total_retrans, lost = _tcp_info_counters(tls_sock)
+        total_retrans, lost, dsack_dups = _tcp_info_counters(tls_sock)
     finally:
         try:
             if tls_sock is not None:
@@ -233,7 +247,14 @@ def run_client(
         writer = csv.writer(f)
         writer.writerow(["Duration", "Sent", "Received", "retrans.", "spurious", "lost"])
         writer.writerow(
-            [f"{(end - start):.6f}", sent, received, total_retrans, 0, lost]
+            [
+                f"{(end - start):.6f}",
+                sent,
+                received,
+                total_retrans,
+                "" if dsack_dups is None else dsack_dups,
+                lost,
+            ]
         )
     return 0
 

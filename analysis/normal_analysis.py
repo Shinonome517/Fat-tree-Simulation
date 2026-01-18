@@ -4,8 +4,8 @@ Analyze normal experiment outputs (QUIC/MPQUIC/TCP/MPTCP).
 This script scans the normal log directory, aggregates elephant goodput,
 mouse flow completion time (FCT), and switch tx byte deltas, then produces
 comparison plots and a text summary. It expects logs under
-logs/normal/<log-dir>/<proto>/<elephant-num>/<congestion-rate>/run_* and
-writes per-(elephant, congestion) results to analysis/plots/normal.
+logs/normal/<log-dir>/<proto>/<elephant-num>/<elephant-MBytes>/run_* and
+writes per-(elephant, elephant-MBytes) results to analysis/plots/normal.
 """
 
 from __future__ import annotations
@@ -43,7 +43,6 @@ MOUSE_DROPLOSS_FILENAME = "normal_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "normal_mouse_retrans_ratio.png"
 LINK_UTIL_SUBDIR = Path("link_utilization")
 DEFAULT_ELEPHANT_NUM = 4
-DEFAULT_CONGESTION_RATE = "0.2"
 
 
 def _positive_int(value: str) -> int:
@@ -61,9 +60,9 @@ def _collect_combos(*dfs: pd.DataFrame) -> set[tuple[int, str]]:
     for df in dfs:
         if df is None or df.empty:
             continue
-        if "elephant_num" not in df.columns or "congestion_rate" not in df.columns:
+        if "elephant_num" not in df.columns or "elephant_MBytes" not in df.columns:
             continue
-        combos.update(zip(df["elephant_num"], df["congestion_rate"]))
+        combos.update(zip(df["elephant_num"], df["elephant_MBytes"]))
     return combos
 
 
@@ -93,12 +92,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--congestion-rate",
-        dest="congestion_rate",
+        "--elephant-MBytes",
+        dest="elephant_MBytes",
         action="append",
+        type=int,
         help=(
-            "Congestion-rate directory name(s) to include (raw string, can be provided multiple times). "
-            "Default: 0.2 (normal.py default)."
+            "Elephant payload size directory name(s) in integer MB (can be provided multiple times). "
+            "Default: include all sizes."
         ),
     )
     parser.add_argument(
@@ -339,10 +339,13 @@ def _subset_mouse(mouse_df: pd.DataFrame, proto: str) -> pd.DataFrame:
     return mouse_df[mouse_df["proto"] == proto]
 
 
-def _count_true(subset: pd.DataFrame, column: str) -> int:
+def _count_valid_true(subset: pd.DataFrame, column: str) -> tuple[int, int]:
     if column not in subset.columns:
-        return 0
-    return int(subset[column].fillna(False).astype(bool).sum())
+        return 0, 0
+    series = subset[column].dropna()
+    if series.empty:
+        return 0, 0
+    return int(series.astype(bool).sum()), len(series)
 
 
 def _plot_link_series(
@@ -437,7 +440,7 @@ def main() -> None:
     setup_logging(args.verbose)
 
     elephant_filter = args.elephant_num or [DEFAULT_ELEPHANT_NUM]
-    congestion_filter = args.congestion_rate or [DEFAULT_CONGESTION_RATE]
+    mbytes_filter = args.elephant_MBytes
 
     output_dir: Path = OUTPUT_ROOT / args.output_dir_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -451,7 +454,7 @@ def main() -> None:
             args.run_id,
             args.latest_n,
             elephant_filter,
-            congestion_filter,
+            mbytes_filter,
         )
     except ValueError as exc:
         logging.error("%s", exc)
@@ -459,11 +462,11 @@ def main() -> None:
 
     if all(not combos for combos in run_dirs_by_proto.values()):
         logging.error(
-            "No run directories selected under %s for protocols: %s (elephant=%s, congestion=%s)",
+            "No run directories selected under %s for protocols: %s (elephant=%s, MBytes=%s)",
             log_root,
             ", ".join(PROTO_ORDER),
             ", ".join(map(str, elephant_filter)),
-            ", ".join(congestion_filter),
+            ", ".join(map(str, mbytes_filter)) if mbytes_filter else "all",
         )
         return
 
@@ -471,29 +474,29 @@ def main() -> None:
         combos = run_dirs_by_proto.get(proto, {})
         if not combos:
             logging.warning(
-                "No runs selected for %s under %s (elephant=%s, congestion=%s)",
+                "No runs selected for %s under %s (elephant=%s, MBytes=%s)",
                 proto,
                 log_root,
                 ", ".join(map(str, elephant_filter)),
-                ", ".join(congestion_filter),
+                ", ".join(map(str, mbytes_filter)) if mbytes_filter else "all",
             )
             continue
-        for (elephant_num, congestion_rate), runs in combos.items():
+        for (elephant_num, elephant_MBytes), runs in combos.items():
             if runs:
                 logging.info(
-                    "Using %d run(s) for %s (E=%s, C=%s): %s",
+                    "Using %d run(s) for %s (E=%s, M=%s MB): %s",
                     len(runs),
                     proto,
                     elephant_num,
-                    congestion_rate,
+                    elephant_MBytes,
                     ", ".join(d.name for d in runs),
                 )
             else:
                 logging.warning(
-                    "No runs selected for %s (E=%s, C=%s)",
+                    "No runs selected for %s (E=%s, M=%s)",
                     proto,
                     elephant_num,
-                    congestion_rate,
+                    elephant_MBytes,
                 )
 
     data = collect_all_data(log_root, PROTO_ORDER, run_dirs_by_proto)
@@ -505,10 +508,10 @@ def main() -> None:
     combos = _collect_combos(elephant_df, mouse_df, link_df, link_ts_df)
     if not combos:
         logging.error(
-            "No data found under %s for filters elephant=%s, congestion=%s",
+            "No data found under %s for filters elephant=%s, MBytes=%s",
             log_root,
             ", ".join(map(str, elephant_filter)),
-            ", ".join(congestion_filter),
+            ", ".join(map(str, mbytes_filter)) if mbytes_filter else "all",
         )
         return
 
@@ -519,27 +522,27 @@ def main() -> None:
         import mouse_droploss_plot as droploss
         import mouse_retrans_plot as retrans
 
-    for elephant_num, congestion_rate in sorted(combos, key=lambda x: (x[0], x[1])):
-        combo_label = f"elephant={elephant_num}, congestion={congestion_rate}"
-        combo_output_dir = output_dir / str(elephant_num) / str(congestion_rate)
+    for elephant_num, elephant_MBytes in sorted(combos, key=lambda x: (x[0], x[1])):
+        combo_label = f"elephant={elephant_num}, MBytes={elephant_MBytes}"
+        combo_output_dir = output_dir / str(elephant_num) / str(elephant_MBytes)
         combo_output_dir.mkdir(parents=True, exist_ok=True)
         logging.info("Analyzing %s -> %s", combo_label, combo_output_dir)
 
         elephant_combo = elephant_df[
             (elephant_df["elephant_num"] == elephant_num)
-            & (elephant_df["congestion_rate"] == congestion_rate)
+            & (elephant_df["elephant_MBytes"] == elephant_MBytes)
         ]
         mouse_combo = mouse_df[
             (mouse_df["elephant_num"] == elephant_num)
-            & (mouse_df["congestion_rate"] == congestion_rate)
+            & (mouse_df["elephant_MBytes"] == elephant_MBytes)
         ]
         link_combo = link_df[
             (link_df["elephant_num"] == elephant_num)
-            & (link_df["congestion_rate"] == congestion_rate)
+            & (link_df["elephant_MBytes"] == elephant_MBytes)
         ]
         link_ts_combo = link_ts_df[
             (link_ts_df["elephant_num"] == elephant_num)
-            & (link_ts_df["congestion_rate"] == congestion_rate)
+            & (link_ts_df["elephant_MBytes"] == elephant_MBytes)
         ]
 
         if (
@@ -611,36 +614,52 @@ def main() -> None:
             mouse_combo,
             fairness_df,
             PROTO_ORDER,
-            experiment_label=f"Normal (E={elephant_num}, C={congestion_rate})",
+            experiment_label=f"Normal (E={elephant_num}, M={elephant_MBytes} MB)",
         )
 
         droploss_summaries: List[droploss.DropLossSummary] = []
         retrans_summaries: List[retrans.RetransSummary] = []
         for proto in PROTO_ORDER:
             runs = run_dirs_by_proto.get(proto, {}).get(
-                (elephant_num, congestion_rate), []
+                (elephant_num, elephant_MBytes), []
             )
             if not runs:
                 continue
             subset = _subset_mouse(mouse_combo, proto)
-            drop_flows = _count_true(subset, "had_drop_retrans")
-            retrans_flows = _count_true(subset, "had_retrans")
-            droploss_summaries.append(
-                droploss.DropLossSummary(
-                    label=proto,
-                    run_dir=runs[-1],
-                    drop_flows=drop_flows,
-                    total_flows=len(subset),
+            drop_flows, drop_total = _count_valid_true(subset, "had_drop_retrans")
+            retrans_flows, retrans_total = _count_valid_true(subset, "had_retrans")
+            if drop_total == 0:
+                logging.warning(
+                    "Drop-loss data nodata for %s (E=%s, M=%s MB): had_drop_retrans all NULL or missing.",
+                    proto,
+                    elephant_num,
+                    elephant_MBytes,
                 )
-            )
-            retrans_summaries.append(
-                retrans.RetransSummary(
-                    label=proto,
-                    run_dir=runs[-1],
-                    retrans_flows=retrans_flows,
-                    total_flows=len(subset),
+            else:
+                droploss_summaries.append(
+                    droploss.DropLossSummary(
+                        label=proto,
+                        run_dir=runs[-1],
+                        drop_flows=drop_flows,
+                        total_flows=drop_total,
+                    )
                 )
-            )
+            if retrans_total == 0:
+                logging.warning(
+                    "Retrans data nodata for %s (E=%s, M=%s MB): had_retrans all NULL or missing.",
+                    proto,
+                    elephant_num,
+                    elephant_MBytes,
+                )
+            else:
+                retrans_summaries.append(
+                    retrans.RetransSummary(
+                        label=proto,
+                        run_dir=runs[-1],
+                        retrans_flows=retrans_flows,
+                        total_flows=retrans_total,
+                    )
+                )
 
         if droploss_summaries:
             droploss_path = droploss.plot_drop_retrans_ratios(

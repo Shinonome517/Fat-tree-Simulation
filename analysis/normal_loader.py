@@ -3,7 +3,7 @@ Load and aggregate normal experiment logs into DataFrames.
 
 This mirrors the blackbox loader structure so analyze scripts stay thin.
 
-Expected layout: logs/normal/<log-dir>/<proto>/<elephant-num>/<congestion-rate>/run_*.
+Expected layout: logs/normal/<log-dir>/<proto>/<elephant-num>/<elephant-MBytes>/run_*.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from csv_utils import find_retrans_column, find_spurious_column, normalize_colum
 RUN_ID_PATTERN = re.compile(r"^run_\d{8}-\d{6}(?:_seed\d+)?$")
 
 
-def list_run_dirs(log_root: Path, proto: str) -> Dict[Tuple[int, str], List[Path]]:
+def list_run_dirs(log_root: Path, proto: str) -> Dict[Tuple[int, int], List[Path]]:
     proto_dir = log_root / proto
     if not proto_dir.exists():
         logging.warning("Protocol directory not found: %s", proto_dir)
@@ -32,7 +32,7 @@ def list_run_dirs(log_root: Path, proto: str) -> Dict[Tuple[int, str], List[Path
         logging.warning("Protocol path is not a directory: %s", proto_dir)
         return {}
 
-    run_dirs: Dict[Tuple[int, str], List[Path]] = {}
+    run_dirs: Dict[Tuple[int, int], List[Path]] = {}
     for elephant_dir in proto_dir.iterdir():
         if not elephant_dir.is_dir():
             continue
@@ -41,12 +41,16 @@ def list_run_dirs(log_root: Path, proto: str) -> Dict[Tuple[int, str], List[Path
         except ValueError:
             logging.warning("Ignoring elephant directory with non-integer name: %s", elephant_dir)
             continue
-        for congestion_dir in elephant_dir.iterdir():
-            if not congestion_dir.is_dir():
+        for mbytes_dir in elephant_dir.iterdir():
+            if not mbytes_dir.is_dir():
                 continue
-            congestion_rate = congestion_dir.name
+            try:
+                elephant_MBytes = int(mbytes_dir.name)
+            except ValueError:
+                logging.warning("Ignoring elephant-MBytes directory with non-integer name: %s", mbytes_dir)
+                continue
             runs: List[Path] = []
-            for entry in congestion_dir.iterdir():
+            for entry in mbytes_dir.iterdir():
                 if not entry.is_dir():
                     continue
                 if not entry.name.startswith("run_"):
@@ -56,10 +60,10 @@ def list_run_dirs(log_root: Path, proto: str) -> Dict[Tuple[int, str], List[Path
                     continue
                 runs.append(entry)
             if runs:
-                run_dirs[(elephant_num, congestion_rate)] = sorted(runs, key=lambda path: path.name)
+                run_dirs[(elephant_num, elephant_MBytes)] = sorted(runs, key=lambda path: path.name)
             else:
                 logging.warning(
-                    "No run_* directories found under %s", congestion_dir
+                    "No run_* directories found under %s", mbytes_dir
                 )
     return run_dirs
 
@@ -70,20 +74,20 @@ def select_run_dirs(
     run_ids: Sequence[str] | None,
     latest_n: int | None,
     elephant_nums: Sequence[int] | None,
-    congestion_rates: Sequence[str] | None,
-) -> Dict[str, Dict[Tuple[int, str], List[Path]]]:
+    elephant_MBytes: Sequence[int] | None,
+) -> Dict[str, Dict[Tuple[int, int], List[Path]]]:
     if run_ids and latest_n is not None:
         raise ValueError("Cannot combine --run-id with --latest-n.")
-    run_dirs_by_proto: Dict[str, Dict[Tuple[int, str], List[Path]]] = {}
+    run_dirs_by_proto: Dict[str, Dict[Tuple[int, int], List[Path]]] = {}
     elephant_filter = set(elephant_nums) if elephant_nums else None
-    congestion_filter = set(congestion_rates) if congestion_rates else None
+    mbytes_filter = set(elephant_MBytes) if elephant_MBytes else None
     for proto in protos:
         available = list_run_dirs(log_root, proto)
-        selected_by_combo: Dict[Tuple[int, str], List[Path]] = {}
-        for (elephant_num, congestion_rate), runs in available.items():
+        selected_by_combo: Dict[Tuple[int, int], List[Path]] = {}
+        for (elephant_num, mbytes_value), runs in available.items():
             if elephant_filter is not None and elephant_num not in elephant_filter:
                 continue
-            if congestion_filter is not None and congestion_rate not in congestion_filter:
+            if mbytes_filter is not None and mbytes_value not in mbytes_filter:
                 continue
             if run_ids:
                 available_by_name = {d.name: d for d in runs}
@@ -99,13 +103,13 @@ def select_run_dirs(
                             log_root,
                             proto,
                             elephant_num,
-                            congestion_rate,
+                            mbytes_value,
                         )
             elif latest_n is not None:
                 if len(runs) < latest_n:
                     raise ValueError(
                         f"Need at least {latest_n} run(s) for {proto} under {log_root} "
-                        f"(elephant={elephant_num}, congestion={congestion_rate}), "
+                        f"(elephant={elephant_num}, MBytes={mbytes_value}), "
                         f"found {len(runs)}."
                     )
                 selected = runs[-latest_n:]
@@ -113,7 +117,7 @@ def select_run_dirs(
                 selected = runs[-1:]
 
             if selected:
-                selected_by_combo[(elephant_num, congestion_rate)] = selected
+                selected_by_combo[(elephant_num, mbytes_value)] = selected
         if not selected_by_combo:
             logging.warning(
                 "No run_* directories found for %s under %s matching filters",
@@ -192,21 +196,42 @@ def load_mouse_fcts(csv_paths: Iterable[Path]) -> List[Dict[str, object]]:
         if retrans_col is None:
             retrans_vals = pd.Series(0, index=df.index, dtype=float)
         else:
-            retrans_vals = pd.to_numeric(df[retrans_col], errors="coerce").fillna(0)
+            retrans_vals = pd.to_numeric(df[retrans_col], errors="coerce")
         if spurious_col is None:
             spurious_vals = pd.Series(0, index=df.index, dtype=float)
         else:
-            spurious_vals = pd.to_numeric(df[spurious_col], errors="coerce").fillna(0)
+            spurious_vals = pd.to_numeric(df[spurious_col], errors="coerce")
 
-        drop_retrans = (retrans_vals - spurious_vals).clip(lower=0)
-        for duration, retrans, drop in zip(
-            durations[valid], retrans_vals[valid], drop_retrans[valid]
-        ):
+        for idx in df.index[valid]:
+            duration_val = float(durations.loc[idx])
+            retrans_val = retrans_vals.loc[idx]
+            retrans_float = float(retrans_val) if pd.notna(retrans_val) else float("nan")
+
+            had_retrans: bool | None = None
+            if not pd.isna(retrans_float):
+                had_retrans = bool(retrans_float > 0)
+
+            had_drop_retrans: bool | None
+            if spurious_col is None:
+                # No spurious column means treat all retrans as drop-induced.
+                if pd.isna(retrans_float):
+                    had_drop_retrans = None
+                else:
+                    had_drop_retrans = bool(max(retrans_float, 0.0) > 0)
+            else:
+                spurious_val = spurious_vals.loc[idx]
+                if pd.isna(spurious_val) or pd.isna(retrans_float):
+                    # Spurious present but missing -> ignore for drop-loss stats.
+                    had_drop_retrans = None
+                else:
+                    drop_retrans = max(retrans_float - float(spurious_val), 0.0)
+                    had_drop_retrans = bool(drop_retrans > 0)
+
             rows.append(
                 {
-                    "fct_s": float(duration),
-                    "had_retrans": bool(float(retrans) > 0),
-                    "had_drop_retrans": bool(float(drop) > 0),
+                    "fct_s": duration_val,
+                    "had_retrans": had_retrans,
+                    "had_drop_retrans": had_drop_retrans,
                 }
             )
     return rows
@@ -269,7 +294,7 @@ def load_link_timeseries(path: Path) -> pd.DataFrame:
 def collect_all_data(
     log_root: Path,
     protos: Sequence[str],
-    run_dirs_by_proto: Mapping[str, Mapping[Tuple[int, str], Sequence[Path]]] | None = None,
+    run_dirs_by_proto: Mapping[str, Mapping[Tuple[int, int], Sequence[Path]]] | None = None,
 ) -> Dict[str, pd.DataFrame]:
     elephant_rows: List[Dict[str, object]] = []
     mouse_rows: List[Dict[str, object]] = []
@@ -281,7 +306,7 @@ def collect_all_data(
 
     for proto in protos:
         proto_runs = run_dirs_by_proto.get(proto, {})
-        for (elephant_num, congestion_rate), run_dirs in proto_runs.items():
+        for (elephant_num, elephant_MBytes), run_dirs in proto_runs.items():
             for run_dir in run_dirs:
                 run_id = run_dir.name
                 elephant_paths = sorted(run_dir.glob("elephant_*.csv"))
@@ -290,9 +315,16 @@ def collect_all_data(
                 after_path = run_dir / "switch_stats_after.json"
                 link_ts_path = run_dir / "link_timeseries.csv"
 
-                missing = []
                 if not elephant_paths:
-                    missing.append("elephant_*.csv")
+                    logging.warning(
+                        "Elephant CSVs missing under %s/%s/%s/%s; continuing without elephant data.",
+                        proto,
+                        elephant_num,
+                        elephant_MBytes,
+                        run_id,
+                    )
+
+                missing = []
                 if not mouse_paths:
                     missing.append("mouse_*.csv")
                 if not link_ts_path.exists():
@@ -305,7 +337,7 @@ def collect_all_data(
                         "Skipping %s/%s/%s/%s due to missing files: %s",
                         proto,
                         elephant_num,
-                        congestion_rate,
+                        elephant_MBytes,
                         run_id,
                         ", ".join(missing),
                     )
@@ -322,7 +354,7 @@ def collect_all_data(
                             {
                                 "proto": proto,
                                 "elephant_num": elephant_num,
-                                "congestion_rate": congestion_rate,
+                                "elephant_MBytes": elephant_MBytes,
                                 "run_id": run_id,
                                 "pair_id": pair_id,
                                 "goodput_mbps": float(val),
@@ -336,7 +368,7 @@ def collect_all_data(
                             {
                                 "proto": proto,
                                 "elephant_num": elephant_num,
-                                "congestion_rate": congestion_rate,
+                                "elephant_MBytes": elephant_MBytes,
                                 "run_id": run_id,
                                 "pair_id": pair_id,
                                 **row,
@@ -349,7 +381,7 @@ def collect_all_data(
                         ts_df = ts_df.copy()
                         ts_df["proto"] = proto
                         ts_df["elephant_num"] = elephant_num
-                        ts_df["congestion_rate"] = congestion_rate
+                        ts_df["elephant_MBytes"] = elephant_MBytes
                         ts_df["run_id"] = run_id
                         link_ts_frames.append(ts_df)
                         totals = ts_df.groupby("if_name")["delta_tx_bytes"].sum().reset_index()
@@ -358,7 +390,7 @@ def collect_all_data(
                                 {
                                     "proto": proto,
                                     "elephant_num": elephant_num,
-                                    "congestion_rate": congestion_rate,
+                                    "elephant_MBytes": elephant_MBytes,
                                     "run_id": run_id,
                                     "if_name": row["if_name"],
                                     "delta_tx_bytes": float(row["delta_tx_bytes"]),
@@ -371,7 +403,7 @@ def collect_all_data(
                             {
                                 "proto": proto,
                                 "elephant_num": elephant_num,
-                                "congestion_rate": congestion_rate,
+                                "elephant_MBytes": elephant_MBytes,
                                 "run_id": run_id,
                                 "if_name": if_name,
                                 "delta_tx_bytes": float(delta),
@@ -383,7 +415,7 @@ def collect_all_data(
         columns=[
             "proto",
             "elephant_num",
-            "congestion_rate",
+            "elephant_MBytes",
             "run_id",
             "pair_id",
             "goodput_mbps",
@@ -394,7 +426,7 @@ def collect_all_data(
         columns=[
             "proto",
             "elephant_num",
-            "congestion_rate",
+            "elephant_MBytes",
             "run_id",
             "pair_id",
             "fct_s",
@@ -407,7 +439,7 @@ def collect_all_data(
         columns=[
             "proto",
             "elephant_num",
-            "congestion_rate",
+            "elephant_MBytes",
             "run_id",
             "if_name",
             "delta_tx_bytes",
@@ -419,7 +451,7 @@ def collect_all_data(
         else pd.DataFrame(
             columns=[
                 "elephant_num",
-                "congestion_rate",
+                "elephant_MBytes",
                 "sample_idx",
                 "elapsed_s",
                 "if_name",
