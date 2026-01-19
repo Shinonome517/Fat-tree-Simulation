@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import matplotlib
+from matplotlib import colors as mcolors
 import numpy as np
 import pandas as pd
 
@@ -40,6 +41,12 @@ LOG_ROOT_BASE = Path("./logs/normal")
 DEFAULT_LOG_DIR_NAME = Path("default")
 OUTPUT_ROOT = Path("./analysis/plots/normal")
 PROTO_ORDER = ("mpquic", "quic", "mptcp", "tcp")
+PROTO_COLORS = {
+    "tcp": "#7f7f7f",
+    "mptcp": "#2ca02c",
+    "quic": "#17becf",
+    "mpquic": "#ff7f0e",
+}
 MOUSE_DROPLOSS_FILENAME = "normal_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "normal_mouse_retrans_ratio.png"
 LINK_UTIL_SUBDIR = Path("link_utilization")
@@ -177,11 +184,20 @@ def setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
 
 
-def _plot_cdf(ax, values: np.ndarray, label: str):
+def _plot_cdf(ax, values: np.ndarray, label: str, color: str | None = None):
     values = np.sort(values)
     y = np.arange(1, len(values) + 1) / len(values)
-    (line,) = ax.step(values, y, where="post", label=label)
+    (line,) = ax.step(values, y, where="post", label=label, color=color)
     return line
+
+
+def _proto_color(proto: str) -> str:
+    return PROTO_COLORS.get(str(proto).lower(), "tab:blue")
+
+
+def _darken_color(color: str, factor: float = 0.8) -> tuple[float, float, float, float]:
+    rgba = mcolors.to_rgba(color)
+    return (rgba[0] * factor, rgba[1] * factor, rgba[2] * factor, rgba[3])
 
 
 def _outlier_mask(values: np.ndarray) -> Tuple[np.ndarray, float, float]:
@@ -202,6 +218,7 @@ def plot_elephant_goodput_bar(
     means: List[float] = []
     stds: List[float] = []
     labels: List[str] = []
+    colors: List[str] = []
     for proto in protos:
         subset = elephant_df[elephant_df["proto"] == proto]
         if subset.empty:
@@ -210,12 +227,21 @@ def plot_elephant_goodput_bar(
         labels.append(proto)
         means.append(subset["goodput_mbps"].mean())
         stds.append(subset["goodput_mbps"].std(ddof=0))
+        colors.append(_proto_color(proto))
 
     if not means:
         ax.text(0.5, 0.5, "No elephant data", ha="center", va="center")
     else:
         x = np.arange(len(labels))
-        ax.bar(x, means, yerr=stds, capsize=8, alpha=0.8, label="mean +/- SD")
+        ax.bar(
+            x,
+            means,
+            yerr=stds,
+            capsize=8,
+            alpha=0.8,
+            color=colors,
+            label="mean +/- SD",
+        )
         ax.set_xticks(x)
         ax.set_xticklabels(labels)
         ax.set_ylabel("Goodput (Mbps)")
@@ -239,6 +265,7 @@ def plot_elephant_goodput_scatter(
         if subset.empty:
             logging.warning("No elephant goodput data for %s", proto)
             continue
+        color = _proto_color(proto)
         positions.append(idx)
         labels.append(proto)
         x = np.full(len(subset), idx, dtype=float)
@@ -250,6 +277,7 @@ def plot_elephant_goodput_scatter(
             alpha=0.8,
             edgecolors="black",
             linewidth=0.4,
+            color=color,
             label=proto,
         )
         has_data = True
@@ -302,16 +330,19 @@ def plot_mouse_fct_cdf(
             logging.warning("No mouse FCT values <= p99 for %s", proto)
             continue
         label = proto if not exclude_outliers else f"{proto} (<=p99)"
-        line = _plot_cdf(ax, values * scale, label)
+        line_color = _proto_color(proto)
+        line = _plot_cdf(ax, values * scale, label, color=line_color)
         color = line.get_color()
         if not exclude_outliers:
             p50, p90, p99 = np.percentile(values * scale, [50, 90, 99])
             ax.scatter(
                 [p50, p90, p99],
                 [0.5, 0.9, 0.99],
-                color=color,
-                marker="x",
-                s=25,
+                facecolors=color,
+                edgecolors="black",
+                marker="X",
+                s=40,
+                linewidths=1.0,
                 label=f"{proto} p50/p90/p99",
             )
             line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
@@ -338,11 +369,12 @@ def plot_mouse_fct_cdf(
                         label=f"{proto} outliers (no retrans)",
                     )
                 if np.any(has_retrans_mask):
+                    retrans_color = _darken_color(color, factor=0.75)
                     ax.scatter(
                         outlier_values[has_retrans_mask],
                         outlier_y[has_retrans_mask],
-                        facecolors=color,
-                        edgecolors=color,
+                        facecolors=retrans_color,
+                        edgecolors=retrans_color,
                         marker="s",
                         s=24,
                         linewidth=0.8,
@@ -793,6 +825,7 @@ def main() -> None:
                 output_dir=combo_output_dir,
                 filename=MOUSE_DROPLOSS_FILENAME,
                 title="Mouse drop-induced retransmissions",
+                color_map=PROTO_COLORS,
             )
             drop_flows = sum(s.drop_flows for s in droploss_summaries)
             total_flows = sum(s.total_flows for s in droploss_summaries)

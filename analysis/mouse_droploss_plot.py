@@ -14,7 +14,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Mapping, Sequence, Tuple
 
 import matplotlib
 import pandas as pd
@@ -104,6 +104,7 @@ def plot_drop_retrans_ratios(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     filename: str | None = None,
     title: str | None = None,
+    color_map: Mapping[str, str] | None = None,
 ) -> Path:
     if not summaries:
         raise ValueError("No run summaries provided for plotting.")
@@ -119,7 +120,14 @@ def plot_drop_retrans_ratios(
     fig_width = max(4.0, len(labels) * 1.4)
     fig, ax = plt.subplots(figsize=(fig_width, 4.0))
 
-    bars = ax.bar(labels, values, color="#4a90e2")
+    if color_map:
+        colors = [
+            color_map.get(label.split(":", 1)[0].lower(), "#4a90e2")
+            for label in labels
+        ]
+        bars = ax.bar(labels, values, color=colors)
+    else:
+        bars = ax.bar(labels, values, color="#4a90e2")
     ax.set_ylabel("Flows with drop-induced retrans (%)")
     if title:
         ax.set_title(title)
