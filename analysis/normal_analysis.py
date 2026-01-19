@@ -240,13 +240,11 @@ def plot_elephant_goodput_bar(
             capsize=8,
             alpha=0.8,
             color=colors,
-            label="mean +/- SD",
         )
         ax.set_xticks(x)
         ax.set_xticklabels(labels)
         ax.set_ylabel("Goodput (Mbps)")
-        ax.set_title("Elephant Goodput (error bars = SD)")
-        ax.legend()
+        ax.set_title("Elephant Goodput mean (error bars = SD)")
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
@@ -291,6 +289,7 @@ def plot_elephant_goodput_scatter(
         ax.set_title("Elephant Goodput per Flow")
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.legend()
+        ax.set_ylim(bottom=0)
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
@@ -845,6 +844,7 @@ def main() -> None:
                 output_dir=combo_output_dir,
                 filename=MOUSE_RETRANS_FILENAME,
                 title="Mouse retransmission ratio",
+                color_map=PROTO_COLORS,
             )
             retrans_flows = sum(s.retrans_flows for s in retrans_summaries)
             total_flows = sum(s.total_flows for s in retrans_summaries)
