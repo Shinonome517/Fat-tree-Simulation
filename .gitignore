@@ -217,5 +217,9 @@ analysis/plots/
 analysis_test/
 *.bin
 run_all.sh
+run_normal.sh
+run_abnormal.sh
 analyze_all.sh
+analyze_normal.sh
+analyze_abnormal.sh
 script_logs*/
