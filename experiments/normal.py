@@ -1112,6 +1112,10 @@ def run_normal_once(
         all_mouse_procs: List[object] = [proc for plist in mouse_proc_lists for proc in plist]
         _terminate_processes(all_mouse_procs, term_timeout=DEFAULT_KILL_GRACE_SECONDS)
 
+        # Stop link sampler before snapshot to avoid node.cmd contention with snapshot_switch_bytes.
+        if link_sampler:
+            link_sampler.stop()
+
         after_stats = snapshot_switch_bytes(ctx)
         (log_dir / "switch_stats_after.json").write_text(
             json.dumps(after_stats, indent=2)
