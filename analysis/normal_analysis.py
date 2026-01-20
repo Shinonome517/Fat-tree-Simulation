@@ -26,7 +26,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
+from plots_goodput import plot_goodput_bar_proto, plot_goodput_scatter_proto
 from plots_link import plot_link_heatmap
+from plots_link_util_summary import plot_run_metric_bar, plot_run_metric_scatter
 from scatter import plot_run_p99_scatter
 from normal_loader import collect_all_data, select_run_dirs
 from normal_metrics import (
@@ -47,9 +49,11 @@ PROTO_COLORS = {
     "quic": "#17becf",
     "mpquic": "#ff7f0e",
 }
+ELEPHANT_GOODPUT_YLIM = (0, 1000)
 MOUSE_DROPLOSS_FILENAME = "normal_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "normal_mouse_retrans_ratio.png"
 LINK_UTIL_SUBDIR = Path("link_utilization")
+LINK_UTIL_RUN_SUMMARY_SUBDIR = LINK_UTIL_SUBDIR / "run_summary"
 DEFAULT_ELEPHANT_NUM = 4
 MOUSE_EXCLUDE_HEAD_S = 1.0
 MOUSE_EXCLUDE_TAIL_S = 1.0
@@ -209,90 +213,6 @@ def _outlier_mask(values: np.ndarray) -> Tuple[np.ndarray, float, float]:
     upper = q3 + 1.5 * iqr
     mask = (values < lower) | (values > upper)
     return mask, lower, upper
-
-
-def plot_elephant_goodput_bar(
-    elephant_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
-) -> None:
-    fig, ax = plt.subplots(figsize=(6, 4))
-    means: List[float] = []
-    stds: List[float] = []
-    labels: List[str] = []
-    colors: List[str] = []
-    for proto in protos:
-        subset = elephant_df[elephant_df["proto"] == proto]
-        if subset.empty:
-            logging.warning("No elephant goodput data for %s", proto)
-            continue
-        labels.append(proto)
-        means.append(subset["goodput_mbps"].mean())
-        stds.append(subset["goodput_mbps"].std(ddof=0))
-        colors.append(_proto_color(proto))
-
-    if not means:
-        ax.text(0.5, 0.5, "No elephant data", ha="center", va="center")
-    else:
-        x = np.arange(len(labels))
-        ax.bar(
-            x,
-            means,
-            yerr=stds,
-            capsize=8,
-            alpha=0.8,
-            color=colors,
-        )
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels)
-        ax.set_ylabel("Goodput (Mbps)")
-        ax.set_title("Elephant Goodput mean (error bars = SD)")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-
-def plot_elephant_goodput_scatter(
-    elephant_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
-) -> None:
-    fig, ax = plt.subplots(figsize=(6, 4))
-    rng = np.random.default_rng(seed=0)
-    has_data = False
-    positions: List[int] = []
-    labels: List[str] = []
-    for idx, proto in enumerate(protos):
-        subset = elephant_df[elephant_df["proto"] == proto]
-        if subset.empty:
-            logging.warning("No elephant goodput data for %s", proto)
-            continue
-        color = _proto_color(proto)
-        positions.append(idx)
-        labels.append(proto)
-        x = np.full(len(subset), idx, dtype=float)
-        if len(subset) > 1:
-            x += rng.uniform(-0.12, 0.12, size=len(subset))
-        ax.scatter(
-            x,
-            subset["goodput_mbps"],
-            alpha=0.8,
-            edgecolors="black",
-            linewidth=0.4,
-            color=color,
-            label=proto,
-        )
-        has_data = True
-
-    if not has_data:
-        ax.text(0.5, 0.5, "No elephant data", ha="center", va="center")
-    else:
-        ax.set_xticks(positions)
-        ax.set_xticklabels(labels)
-        ax.set_ylabel("Goodput (Mbps)")
-        ax.set_title("Elephant Goodput per Flow")
-        ax.grid(True, linestyle="--", alpha=0.4)
-        ax.legend()
-        ax.set_ylim(bottom=0)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
 
 
 def plot_mouse_fct_cdf(
@@ -490,6 +410,65 @@ def _exclude_mouse_warmup_tail(
     return filtered
 
 
+def _exclude_link_warmup_tail(
+    util_df: pd.DataFrame,
+    *,
+    warmup_s: float,
+    tail_s: float,
+) -> pd.DataFrame:
+    if util_df.empty:
+        return util_df
+    required = {"proto", "run_id", "elapsed_s"}
+    missing = [col for col in required if col not in util_df.columns]
+    if missing:
+        logging.warning(
+            "Link utilization missing columns %s; skipping warmup/tail exclusion.",
+            ", ".join(missing),
+        )
+        return util_df
+
+    df = util_df.copy()
+    df["elapsed_s"] = pd.to_numeric(df["elapsed_s"], errors="coerce")
+    mask = pd.Series(True, index=df.index)
+
+    for (proto, run_id), group in df.groupby(["proto", "run_id"], sort=False):
+        max_elapsed = group["elapsed_s"].max()
+        if pd.isna(max_elapsed):
+            logging.warning(
+                "elapsed_s missing for %s run %s; keeping all link-util samples.",
+                proto,
+                run_id,
+            )
+            continue
+
+        min_keep = warmup_s if warmup_s > 0 else float("-inf")
+        max_keep = max_elapsed - tail_s if tail_s > 0 else max_elapsed
+        keep = (group["elapsed_s"] >= min_keep) & (group["elapsed_s"] <= max_keep)
+        dropped = int((~keep).sum())
+        if dropped:
+            logging.info(
+                "Excluded %d link-util samples for %s run %s: warmup=%.3f s, tail=%.3f s, max_elapsed=%.3f s.",
+                dropped,
+                proto,
+                run_id,
+                warmup_s,
+                tail_s,
+                max_elapsed,
+            )
+        if keep.sum() == 0:
+            logging.warning(
+                "All link-util samples excluded for %s run %s (warmup=%.3f s, tail=%.3f s, max_elapsed=%.3f s).",
+                proto,
+                run_id,
+                warmup_s,
+                tail_s,
+                max_elapsed,
+            )
+        mask.loc[group.index] = keep
+
+    return df[mask]
+
+
 def _count_valid_true(subset: pd.DataFrame, column: str) -> tuple[int, int]:
     if column not in subset.columns:
         return 0, 0
@@ -497,6 +476,86 @@ def _count_valid_true(subset: pd.DataFrame, column: str) -> tuple[int, int]:
     if series.empty:
         return 0, 0
     return int(series.astype(bool).sum()), len(series)
+
+
+def _summarize_link_util_runs(util_df: pd.DataFrame) -> pd.DataFrame:
+    if util_df.empty:
+        return pd.DataFrame(
+            columns=["proto", "run_id", "cv_time_avg", "u_mean_time_avg", "u_max_time_avg"]
+        )
+    required = {"proto", "run_id", "u_mean", "u_max", "cv"}
+    missing = [col for col in required if col not in util_df.columns]
+    if missing:
+        logging.warning("Link utilization summary missing columns: %s", ", ".join(missing))
+        return pd.DataFrame(
+            columns=["proto", "run_id", "cv_time_avg", "u_mean_time_avg", "u_max_time_avg"]
+        )
+
+    df = util_df.copy()
+    df["cv"] = df["cv"].where(df["u_mean"] != 0, np.nan)
+    summary = (
+        df.groupby(["proto", "run_id"], sort=False)
+        .agg(
+            cv_time_avg=("cv", "mean"),
+            u_mean_time_avg=("u_mean", "mean"),
+            u_max_time_avg=("u_max", "mean"),
+        )
+        .reset_index()
+    )
+    return summary
+
+
+def _plot_link_util_run_summaries(
+    run_summary_df: pd.DataFrame,
+    output_root: Path,
+    protos: Sequence[str],
+) -> None:
+    if run_summary_df.empty:
+        logging.warning("No link utilization run summaries to plot.")
+        return
+
+    summary_root = output_root / LINK_UTIL_RUN_SUMMARY_SUBDIR
+    summary_root.mkdir(parents=True, exist_ok=True)
+    summary_specs = [
+        (
+            "cv_time_avg",
+            "Coeff. of variation (time avg)",
+            "cv",
+            "Link utilization CV (per-run time avg)",
+        ),
+        (
+            "u_mean_time_avg",
+            "Mean utilization (time avg)",
+            "u_mean",
+            "Link utilization mean (per-run time avg)",
+        ),
+        (
+            "u_max_time_avg",
+            "Max utilization (time avg)",
+            "u_max",
+            "Link utilization max (per-run time avg)",
+        ),
+    ]
+    for metric, ylabel, prefix, title in summary_specs:
+        metric_df = run_summary_df[run_summary_df[metric].notna()]
+        plot_run_metric_bar(
+            metric_df,
+            summary_root / f"{prefix}_bar.png",
+            protos,
+            metric,
+            ylabel,
+            title=title,
+            proto_colors=PROTO_COLORS,
+        )
+        plot_run_metric_scatter(
+            metric_df,
+            summary_root / f"{prefix}_scatter.png",
+            protos,
+            metric,
+            ylabel,
+            title=title,
+            proto_colors=PROTO_COLORS,
+        )
 
 
 def _plot_link_series(
@@ -713,21 +772,31 @@ def main() -> None:
 
         fairness_df = compute_fairness(link_combo)
         util_df = compute_link_util_series(link_ts_combo)
+        util_df = _exclude_link_warmup_tail(
+            util_df,
+            warmup_s=MOUSE_EXCLUDE_HEAD_S,
+            tail_s=MOUSE_EXCLUDE_TAIL_S,
+        )
         u_max_percentiles = compute_u_max_percentiles(util_df)
+        run_summary_df = _summarize_link_util_runs(util_df)
 
         plot_fattree_topology(
             combo_output_dir / f"fattree_topology_k{args.k}.png",
             k=args.k,
         )
-        plot_elephant_goodput_bar(
+        plot_goodput_bar_proto(
             elephant_combo,
             combo_output_dir / "normal_elephant_goodput_bar.png",
             PROTO_ORDER,
+            proto_colors=PROTO_COLORS,
+            y_lim=ELEPHANT_GOODPUT_YLIM,
         )
-        plot_elephant_goodput_scatter(
+        plot_goodput_scatter_proto(
             elephant_combo,
             combo_output_dir / "normal_elephant_goodput_scatter.png",
             PROTO_ORDER,
+            proto_colors=PROTO_COLORS,
+            y_lim=ELEPHANT_GOODPUT_YLIM,
         )
         plot_mouse_fct_cdf(
             mouse_combo,
@@ -763,6 +832,11 @@ def main() -> None:
             util_df,
             u_max_percentiles,
             output_root=combo_output_dir,
+        )
+        _plot_link_util_run_summaries(
+            run_summary_df,
+            combo_output_dir,
+            PROTO_ORDER,
         )
 
         write_summary(

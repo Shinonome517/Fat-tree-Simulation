@@ -1,8 +1,8 @@
-"""Abnormal loss injection experiments (Blackbox-derived; adds TCP/MPTCP).
+"""Abnormal bandwidth injection experiments (Blackbox-derived; adds TCP/MPTCP).
 
-This module launches random Elephant/Mouse flows across the Fat-Tree, injects
-static loss on a specific link before traffic starts, and captures switch
-statistics to compare QUIC/MPQUIC/TCP/MPTCP under ECMP.
+This module launches random Elephant/Mouse flows across the Fat-Tree, applies
+a static bandwidth cap on a specific link before traffic starts, and captures
+switch statistics to compare QUIC/MPQUIC/TCP/MPTCP under ECMP.
 """
 
 import argparse
@@ -44,9 +44,9 @@ WARMUP_SECONDS = 1.0
 ELEPHANT_CLIENT_TIMEOUT_S = 120.0  # watchdog for elephant clients after traffic start
 ELEPHANT_MBYTES = 1000
 
-LOSS_TARGET_POD = 0
-LOSS_TARGET_AGG = 1
-LOSS_TARGET_CORE = 3
+BW_TARGET_POD = 0
+BW_TARGET_AGG = 1
+BW_TARGET_CORE = 3
 
 # TCP short-flow survivability (λ=80 flows/s) – intentionally aggressive for the closed DCNW lab.
 TCP_SYSCTL_SETTINGS = {
@@ -105,24 +105,24 @@ def _normalize_extra_args(extra_args) -> List[str]:
     return [str(a) for a in extra_args if str(a)]
 
 
-def _format_loss_rate_dir(loss_rate: float) -> str:
-    return f"{loss_rate:g}"
+def _format_bw_dir(bw_mbps: int) -> str:
+    return f"bw-{bw_mbps:g}"
 
 
-def _loss_target_interfaces(ctx) -> List[object]:
+def _bw_target_interfaces(ctx) -> List[object]:
     try:
-        agg_node = ctx.aggs[LOSS_TARGET_POD][LOSS_TARGET_AGG]
+        agg_node = ctx.aggs[BW_TARGET_POD][BW_TARGET_AGG]
     except Exception as exc:
         raise RuntimeError(
-            f"Loss target agg a{LOSS_TARGET_POD}{LOSS_TARGET_AGG} not available"
+            f"Bandwidth target agg a{BW_TARGET_POD}{BW_TARGET_AGG} not available"
         ) from exc
     try:
-        core_node = ctx.cores[LOSS_TARGET_CORE]
+        core_node = ctx.cores[BW_TARGET_CORE]
     except Exception as exc:
-        raise RuntimeError(f"Loss target core c{LOSS_TARGET_CORE} not available") from exc
+        raise RuntimeError(f"Bandwidth target core c{BW_TARGET_CORE} not available") from exc
 
-    agg_if = f"a{LOSS_TARGET_POD}{LOSS_TARGET_AGG}-to-c{LOSS_TARGET_CORE}"
-    core_if = f"c{LOSS_TARGET_CORE}-to-a{LOSS_TARGET_POD}{LOSS_TARGET_AGG}"
+    agg_if = f"a{BW_TARGET_POD}{BW_TARGET_AGG}-to-c{BW_TARGET_CORE}"
+    core_if = f"c{BW_TARGET_CORE}-to-a{BW_TARGET_POD}{BW_TARGET_AGG}"
     agg_intf = agg_node.intf(agg_if)
     core_intf = core_node.intf(core_if)
     if agg_intf is None:
@@ -132,10 +132,10 @@ def _loss_target_interfaces(ctx) -> List[object]:
     return [agg_intf, core_intf]
 
 
-def _apply_static_loss(
-    intfs: Sequence[object], link_params: Dict[str, object], loss_rate: float
+def _apply_static_bandwidth(
+    intfs: Sequence[object], link_params: Dict[str, object], bw_mbps: int
 ) -> None:
-    cfg: Dict[str, object] = {"loss": loss_rate}
+    cfg: Dict[str, object] = {"bw": bw_mbps, "use_htb": True}
     for key in ("bw", "delay", "max_queue_size", "use_htb"):
         if key in link_params:
             cfg[key] = link_params[key]
@@ -149,13 +149,13 @@ def _mark_run_invalid(log_dir: Path, run_tag: str, reason: str) -> None:
     path.write_text(f"[{timestamp}] {run_tag} {reason}\n")
 
 
-def _positive_loss_rate(value: str) -> float:
+def _positive_bw_mbps(value: str) -> int:
     try:
-        parsed = float(value)
+        parsed = int(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"Invalid loss rate: {value}") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("Loss rate must be positive.")
+        raise argparse.ArgumentTypeError(f"Invalid bandwidth: {value}") from exc
+    if parsed < 10 or parsed > 1000:
+        raise argparse.ArgumentTypeError("Bandwidth must be between 10 and 1000 Mbps.")
     return parsed
 
 
@@ -282,12 +282,21 @@ def _verify_tcp_servers(hosts: Iterable, port: int, label: str) -> None:
 class LinkSampler:
     """Sample agg->core tx_bytes and compute utilization per LINK_SAMPLE_INTERVAL_S."""
 
-    def __init__(self, ctx, log_dir: Path, bw_mbps: int, run_tag: str, interval_s: float = LINK_SAMPLE_INTERVAL_S):
+    def __init__(
+        self,
+        ctx,
+        log_dir: Path,
+        bw_mbps: int,
+        run_tag: str,
+        interval_s: float = LINK_SAMPLE_INTERVAL_S,
+        override_bw_mbps: Optional[Dict[str, int]] = None,
+    ):
         self.ctx = ctx
         self.log_dir = log_dir
         self.interval_s = interval_s
         self.bw_mbps = bw_mbps
         self.run_tag = run_tag
+        self.override_bw_mbps = override_bw_mbps or {}
         self.log_path = log_dir / "link_timeseries.csv"
         self.meta_path = log_dir / "link_timeseries_meta.json"
         self._stop = threading.Event()
@@ -314,6 +323,7 @@ class LinkSampler:
                 "bw_mbps": self.bw_mbps,
                 "sample_interval_s": self.interval_s,
                 "interfaces": sorted([name for names in iface_map.values() for name in names]),
+                "override_bw_mbps": self.override_bw_mbps,
             }
             self.meta_path.write_text(json.dumps(meta, indent=2))
         return iface_map
@@ -393,7 +403,8 @@ class LinkSampler:
                         if curr_val is None:
                             continue
                         delta = max(0.0, curr_val - prev.get(if_name, 0.0))
-                        util = (delta * 8.0) / (self.bw_mbps * 1_000_000 * dt)
+                        bw_mbps = self.override_bw_mbps.get(if_name, self.bw_mbps)
+                        util = (delta * 8.0) / (bw_mbps * 1_000_000 * dt)
                         writer.writerow([sample_idx, elapsed, if_name, delta, util, dt])
                     prev = curr
                     last_time = now
@@ -877,17 +888,17 @@ def run_abnormal_once(
     base_seed: int,
     run_index: int,
     elephant_num: int,
-    loss_rate: float,
+    bw_mbps: int,
     enable_qlog: bool = False,
     output_subdir: Optional[Path] = None,
 ) -> None:
-    """Execute one abnormal loss-injection experiment run."""
+    """Execute one abnormal bandwidth-injection experiment run."""
     seed = base_seed + run_index
     rng = random.Random(seed)
     run_tag = f"[run{run_index:04d}]"
     print(
         f"{run_tag} starting abnormal run (proto={proto}, k={k}, seed={seed}, "
-        f"E={elephant_num}, loss={loss_rate:.3f}%)"
+        f"E={elephant_num}, bw={bw_mbps}Mbps)"
     )
 
     log_root = Path("logs") / LOG_ROOT_NAME / (output_subdir or Path("default"))
@@ -896,7 +907,7 @@ def run_abnormal_once(
         proto,
         log_root=log_root,
         suffix=f"seed{seed}",
-        extra_parts=[str(elephant_num), _format_loss_rate_dir(loss_rate)],
+        extra_parts=[str(elephant_num), _format_bw_dir(bw_mbps)],
     )
 
     ctx = None
@@ -920,6 +931,18 @@ def run_abnormal_once(
         hosts_flat = [h for pod in ctx.hosts for edge in pod for h in edge]
         print(f"{run_tag} hosts ready: {len(hosts_flat)} total.")
         _apply_tcp_sysctls(hosts_flat, proto)
+        try:
+            bw_intfs = _bw_target_interfaces(ctx)
+            _apply_static_bandwidth(bw_intfs, ctx.link_params, bw_mbps)
+            print(
+                f"{run_tag} bw={bw_mbps}Mbps applied on "
+                f"a{BW_TARGET_POD}{BW_TARGET_AGG}-c{BW_TARGET_CORE} before traffic."
+            )
+        except Exception as exc:
+            reason = f"Static bandwidth apply failed: {exc}"
+            print(f"{run_tag} {reason}", file=sys.stderr)
+            _mark_run_invalid(log_dir, run_tag, reason)
+            return
 
         ele_src_pool = mouse_src_pool = hosts_flat
 
@@ -1085,18 +1108,11 @@ def run_abnormal_once(
             )
         _ensure_servers_alive("after healthcheck")
 
-        try:
-            loss_intfs = _loss_target_interfaces(ctx)
-            _apply_static_loss(loss_intfs, ctx.link_params, loss_rate)
-            print(
-                f"{run_tag} loss={loss_rate:.3f}% applied on "
-                f"a{LOSS_TARGET_POD}{LOSS_TARGET_AGG}-c{LOSS_TARGET_CORE} before traffic."
-            )
-        except Exception as exc:
-            reason = f"Static loss apply failed: {exc}"
-            print(f"{run_tag} {reason}", file=sys.stderr)
-            _mark_run_invalid(log_dir, run_tag, reason)
-            return
+        bw_override: Dict[str, int] = {}
+        for intf in bw_intfs:
+            name = getattr(intf, "name", None)
+            if name:
+                bw_override[name] = bw_mbps
 
         link_sampler = LinkSampler(
             ctx,
@@ -1104,6 +1120,7 @@ def run_abnormal_once(
             bw_mbps=DEFAULT_LINK_BW_MBPS,
             run_tag=run_tag,
             interval_s=LINK_SAMPLE_INTERVAL_S,
+            override_bw_mbps=bw_override,
         )
 
         print(f"{run_tag} warming up for {WARMUP_SECONDS}s.")
@@ -1238,7 +1255,7 @@ def run_abnormal_once(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Abnormal loss experiment driver (QUIC/MPQUIC/TCP/MPTCP)."
+        description="Abnormal bandwidth experiment driver (QUIC/MPQUIC/TCP/MPTCP)."
     )
     parser.add_argument("--proto", required=True, choices=list(PROTO_CHOICES))
     parser.add_argument("--runs", type=int, default=5)
@@ -1250,15 +1267,15 @@ def main() -> None:
         default=Path("default"),
         help=(
             "Subdirectory name under logs/abnormal. Each run writes to "
-            "logs/abnormal/<output-dir>/<proto>/<elephant-num>/<loss-rate>/"
+            "logs/abnormal/<output-dir>/<proto>/<elephant-num>/bw-<Mbps>/"
             "run_<timestamp>_seed<seed+run_index> (default: default)."
         ),
     )
     parser.add_argument(
-        "--loss-rate",
-        type=_positive_loss_rate,
+        "--bw",
+        type=_positive_bw_mbps,
         required=True,
-        help="Loss rate to inject on the target link (percent, e.g., 0.1 for 0.1%%).",
+        help="Bandwidth cap to inject on the target link in Mbps (10-1000).",
     )
     parser.add_argument(
         "--elephant-num",
@@ -1280,7 +1297,7 @@ def main() -> None:
             base_seed=args.seed,
             run_index=run_idx,
             elephant_num=args.elephant_num,
-            loss_rate=args.loss_rate,
+            bw_mbps=args.bw,
             enable_qlog=args.enable_qlog,
             output_subdir=args.output_dir,
         )

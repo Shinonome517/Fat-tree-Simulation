@@ -3,7 +3,8 @@ Load and aggregate abnormal experiment logs into DataFrames.
 
 This mirrors the blackbox loader structure so analyze scripts stay thin.
 
-Expected layout: logs/abnormal/<log-dir>/<proto>/<elephant-num>/<loss-rate>/run_*.
+Expected layout: logs/abnormal/<log-dir>/<proto>/<elephant-num>/<loss-rate>/run_*
+or logs/abnormal/<log-dir>/<proto>/<elephant-num>/bw-<Mbps>/run_*.
 """
 
 from __future__ import annotations
@@ -23,7 +24,22 @@ from csv_utils import find_retrans_column, find_spurious_column, normalize_colum
 RUN_ID_PATTERN = re.compile(r"^run_\d{8}-\d{6}(?:_seed\d+)?$")
 
 
-def list_run_dirs(log_root: Path, proto: str) -> Dict[Tuple[int, float], List[Path]]:
+def _parse_impairment_dir(name: str) -> tuple[str, float] | None:
+    if not name:
+        return None
+    if name.startswith("bw-"):
+        raw = name[3:]
+        try:
+            return "bw", float(raw)
+        except ValueError:
+            return None
+    try:
+        return "loss", float(name)
+    except ValueError:
+        return None
+
+
+def list_run_dirs(log_root: Path, proto: str) -> Dict[Tuple[int, str, float], List[Path]]:
     proto_dir = log_root / proto
     if not proto_dir.exists():
         logging.warning("Protocol directory not found: %s", proto_dir)
@@ -41,18 +57,18 @@ def list_run_dirs(log_root: Path, proto: str) -> Dict[Tuple[int, float], List[Pa
         except ValueError:
             logging.warning("Ignoring elephant directory with non-integer name: %s", elephant_dir)
             continue
-        for loss_dir in elephant_dir.iterdir():
-            if not loss_dir.is_dir():
+        for impairment_dir in elephant_dir.iterdir():
+            if not impairment_dir.is_dir():
                 continue
-            try:
-                loss_rate = float(loss_dir.name)
-            except ValueError:
+            parsed = _parse_impairment_dir(impairment_dir.name)
+            if not parsed:
                 logging.warning(
-                    "Ignoring loss-rate directory with non-numeric name: %s", loss_dir
+                    "Ignoring impairment directory with unexpected name: %s", impairment_dir
                 )
                 continue
+            kind, value = parsed
             runs: List[Path] = []
-            for entry in loss_dir.iterdir():
+            for entry in impairment_dir.iterdir():
                 if not entry.is_dir():
                     continue
                 if not entry.name.startswith("run_"):
@@ -62,10 +78,12 @@ def list_run_dirs(log_root: Path, proto: str) -> Dict[Tuple[int, float], List[Pa
                     continue
                 runs.append(entry)
             if runs:
-                run_dirs[(elephant_num, loss_rate)] = sorted(runs, key=lambda path: path.name)
+                run_dirs[(elephant_num, kind, value)] = sorted(
+                    runs, key=lambda path: path.name
+                )
             else:
                 logging.warning(
-                    "No run_* directories found under %s", loss_dir
+                    "No run_* directories found under %s", impairment_dir
                 )
     return run_dirs
 
@@ -77,20 +95,26 @@ def select_run_dirs(
     latest_n: int | None,
     elephant_nums: Sequence[int] | None,
     loss_rates: Sequence[float] | None,
-) -> Dict[str, Dict[Tuple[int, float], List[Path]]]:
+    bw_rates: Sequence[float] | None,
+) -> Dict[str, Dict[Tuple[int, str, float], List[Path]]]:
     if run_ids and latest_n is not None:
         raise ValueError("Cannot combine --run-id with --latest-n.")
-    run_dirs_by_proto: Dict[str, Dict[Tuple[int, float], List[Path]]] = {}
+    run_dirs_by_proto: Dict[str, Dict[Tuple[int, str, float], List[Path]]] = {}
     elephant_filter = set(elephant_nums) if elephant_nums else None
     loss_filter = set(loss_rates) if loss_rates else None
+    bw_filter = set(bw_rates) if bw_rates else None
     for proto in protos:
         available = list_run_dirs(log_root, proto)
-        selected_by_combo: Dict[Tuple[int, float], List[Path]] = {}
-        for (elephant_num, loss_rate), runs in available.items():
+        selected_by_combo: Dict[Tuple[int, str, float], List[Path]] = {}
+        for (elephant_num, kind, value), runs in available.items():
             if elephant_filter is not None and elephant_num not in elephant_filter:
                 continue
-            if loss_filter is not None and loss_rate not in loss_filter:
-                continue
+            if kind == "loss":
+                if loss_filter is not None and value not in loss_filter:
+                    continue
+            elif kind == "bw":
+                if bw_filter is not None and value not in bw_filter:
+                    continue
             if run_ids:
                 available_by_name = {d.name: d for d in runs}
                 selected = []
@@ -105,13 +129,13 @@ def select_run_dirs(
                             log_root,
                             proto,
                             elephant_num,
-                            loss_rate,
+                            value,
                         )
             elif latest_n is not None:
                 if len(runs) < latest_n:
                     raise ValueError(
                         f"Need at least {latest_n} run(s) for {proto} under {log_root} "
-                        f"(elephant={elephant_num}, loss={loss_rate}), "
+                        f"(elephant={elephant_num}, {kind}={value}), "
                         f"found {len(runs)}."
                     )
                 selected = runs[-latest_n:]
@@ -119,7 +143,7 @@ def select_run_dirs(
                 selected = runs[-1:]
 
             if selected:
-                selected_by_combo[(elephant_num, loss_rate)] = selected
+                selected_by_combo[(elephant_num, kind, value)] = selected
         if not selected_by_combo:
             logging.warning(
                 "No run_* directories found for %s under %s matching filters",
@@ -296,7 +320,7 @@ def load_link_timeseries(path: Path) -> pd.DataFrame:
 def collect_all_data(
     log_root: Path,
     protos: Sequence[str],
-    run_dirs_by_proto: Mapping[str, Mapping[Tuple[int, float], Sequence[Path]]] | None = None,
+    run_dirs_by_proto: Mapping[str, Mapping[Tuple[int, str, float], Sequence[Path]]] | None = None,
 ) -> Dict[str, pd.DataFrame]:
     elephant_rows: List[Dict[str, object]] = []
     mouse_rows: List[Dict[str, object]] = []
@@ -308,7 +332,7 @@ def collect_all_data(
 
     for proto in protos:
         proto_runs = run_dirs_by_proto.get(proto, {})
-        for (elephant_num, loss_rate), run_dirs in proto_runs.items():
+        for (elephant_num, kind, value), run_dirs in proto_runs.items():
             for run_dir in run_dirs:
                 run_id = run_dir.name
                 elephant_paths = sorted(run_dir.glob("elephant_*.csv"))
@@ -322,7 +346,7 @@ def collect_all_data(
                         "Elephant CSVs missing under %s/%s/%s/%s; continuing without elephant data.",
                         proto,
                         elephant_num,
-                        loss_rate,
+                        value,
                         run_id,
                     )
 
@@ -339,7 +363,7 @@ def collect_all_data(
                         "Skipping %s/%s/%s/%s due to missing files: %s",
                         proto,
                         elephant_num,
-                        loss_rate,
+                        value,
                         run_id,
                         ", ".join(missing),
                     )
@@ -356,7 +380,9 @@ def collect_all_data(
                             {
                                 "proto": proto,
                                 "elephant_num": elephant_num,
-                                "loss_rate": loss_rate,
+                                "loss_rate": value,
+                                "impairment_kind": kind,
+                                "impairment_value": value,
                                 "run_id": run_id,
                                 "pair_id": pair_id,
                                 "goodput_mbps": float(val),
@@ -370,7 +396,9 @@ def collect_all_data(
                             {
                                 "proto": proto,
                                 "elephant_num": elephant_num,
-                                "loss_rate": loss_rate,
+                                "loss_rate": value,
+                                "impairment_kind": kind,
+                                "impairment_value": value,
                                 "run_id": run_id,
                                 "pair_id": pair_id,
                                 **row,
@@ -383,7 +411,9 @@ def collect_all_data(
                         ts_df = ts_df.copy()
                         ts_df["proto"] = proto
                         ts_df["elephant_num"] = elephant_num
-                        ts_df["loss_rate"] = loss_rate
+                        ts_df["loss_rate"] = value
+                        ts_df["impairment_kind"] = kind
+                        ts_df["impairment_value"] = value
                         ts_df["run_id"] = run_id
                         link_ts_frames.append(ts_df)
                         totals = ts_df.groupby("if_name")["delta_tx_bytes"].sum().reset_index()
@@ -392,7 +422,9 @@ def collect_all_data(
                                 {
                                     "proto": proto,
                                     "elephant_num": elephant_num,
-                                    "loss_rate": loss_rate,
+                                    "loss_rate": value,
+                                    "impairment_kind": kind,
+                                    "impairment_value": value,
                                     "run_id": run_id,
                                     "if_name": row["if_name"],
                                     "delta_tx_bytes": float(row["delta_tx_bytes"]),
@@ -405,7 +437,9 @@ def collect_all_data(
                             {
                                 "proto": proto,
                                 "elephant_num": elephant_num,
-                                "loss_rate": loss_rate,
+                                "loss_rate": value,
+                                "impairment_kind": kind,
+                                "impairment_value": value,
                                 "run_id": run_id,
                                 "if_name": if_name,
                                 "delta_tx_bytes": float(delta),
@@ -418,6 +452,8 @@ def collect_all_data(
             "proto",
             "elephant_num",
             "loss_rate",
+            "impairment_kind",
+            "impairment_value",
             "run_id",
             "pair_id",
             "goodput_mbps",
@@ -429,6 +465,8 @@ def collect_all_data(
             "proto",
             "elephant_num",
             "loss_rate",
+            "impairment_kind",
+            "impairment_value",
             "run_id",
             "pair_id",
             "fct_s",
@@ -442,6 +480,8 @@ def collect_all_data(
             "proto",
             "elephant_num",
             "loss_rate",
+            "impairment_kind",
+            "impairment_value",
             "run_id",
             "if_name",
             "delta_tx_bytes",
@@ -454,6 +494,8 @@ def collect_all_data(
             columns=[
                 "elephant_num",
                 "loss_rate",
+                "impairment_kind",
+                "impairment_value",
                 "sample_idx",
                 "elapsed_s",
                 "if_name",

@@ -4,8 +4,9 @@ Analyze abnormal experiment outputs (QUIC/MPQUIC/TCP/MPTCP).
 This script scans the abnormal log directory, aggregates elephant goodput,
 mouse flow completion time (FCT), and switch tx byte deltas, then produces
 comparison plots and a text summary. It expects logs under
-logs/abnormal/<log-dir>/<proto>/<elephant-num>/<loss-rate>/run_* and
-writes per-(elephant, loss-rate) results to analysis/plots/abnormal.
+logs/abnormal/<log-dir>/<proto>/<elephant-num>/<loss-rate>/run_* or
+logs/abnormal/<log-dir>/<proto>/<elephant-num>/bw-<Mbps>/run_* and
+writes per-(elephant, impairment) results to analysis/plots/abnormal.
 """
 
 from __future__ import annotations
@@ -26,7 +27,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
+from plots_goodput import plot_goodput_bar_proto, plot_goodput_scatter_proto
 from plots_link import plot_link_heatmap
+from plots_link_util_summary import plot_run_metric_bar, plot_run_metric_scatter
 from scatter import plot_run_p99_scatter
 from abnormal_loader import collect_all_data, select_run_dirs
 from abnormal_metrics import (
@@ -47,9 +50,11 @@ PROTO_COLORS = {
     "quic": "#17becf",
     "mpquic": "#ff7f0e",
 }
+ELEPHANT_GOODPUT_YLIM = (0, 1000)
 MOUSE_DROPLOSS_FILENAME = "abnormal_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "abnormal_mouse_retrans_ratio.png"
 LINK_UTIL_SUBDIR = Path("link_utilization")
+LINK_UTIL_RUN_SUMMARY_SUBDIR = LINK_UTIL_SUBDIR / "run_summary"
 DEFAULT_ELEPHANT_NUM = 4
 MOUSE_EXCLUDE_HEAD_S = 1.0
 MOUSE_EXCLUDE_TAIL_S = 1.0
@@ -75,19 +80,55 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
-def _format_loss_rate_dir(loss_rate: float) -> str:
-    return f"{loss_rate:g}"
+def _format_impairment_dir(kind: str, value: float) -> str:
+    if kind == "bw":
+        return f"bw-{value:g}"
+    return f"{value:g}"
 
 
-def _collect_combos(*dfs: pd.DataFrame) -> set[tuple[int, float]]:
-    combos: set[tuple[int, float]] = set()
+def _impairment_label(kind: str, value: float) -> str:
+    if kind == "bw":
+        return f"bw={value:g}Mbps"
+    return f"loss={value:g}%"
+
+
+def _collect_combos(*dfs: pd.DataFrame) -> set[tuple[int, str, float]]:
+    combos: set[tuple[int, str, float]] = set()
     for df in dfs:
         if df is None or df.empty:
             continue
-        if "elephant_num" not in df.columns or "loss_rate" not in df.columns:
+        if "elephant_num" not in df.columns:
             continue
-        combos.update(zip(df["elephant_num"], df["loss_rate"]))
+        if "impairment_kind" in df.columns and "impairment_value" in df.columns:
+            combos.update(zip(df["elephant_num"], df["impairment_kind"], df["impairment_value"]))
+        elif "loss_rate" in df.columns:
+            combos.update(zip(df["elephant_num"], ["loss"] * len(df), df["loss_rate"]))
     return combos
+
+
+def _impairment_group_cols(df: pd.DataFrame) -> List[str]:
+    if "impairment_kind" in df.columns and "impairment_value" in df.columns:
+        return ["proto", "run_id", "elephant_num", "impairment_kind", "impairment_value"]
+    return ["proto", "run_id", "elephant_num", "loss_rate"]
+
+
+def _filter_combo(
+    df: pd.DataFrame,
+    elephant_num: int,
+    kind: str,
+    value: float,
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if "impairment_kind" in df.columns and "impairment_value" in df.columns:
+        return df[
+            (df["elephant_num"] == elephant_num)
+            & (df["impairment_kind"] == kind)
+            & (df["impairment_value"] == value)
+        ]
+    if "loss_rate" in df.columns:
+        return df[(df["elephant_num"] == elephant_num) & (df["loss_rate"] == value)]
+    return df.iloc[0:0]
 
 
 def _split_pair_id(pair_id: Any) -> tuple[str | None, int | None]:
@@ -137,6 +178,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Loss rate directory name(s) in percent (can be provided multiple times). "
             "Default: include all rates."
+        ),
+    )
+    parser.add_argument(
+        "--bw",
+        dest="bw",
+        action="append",
+        type=_positive_float,
+        help=(
+            "Bandwidth directory value(s) in Mbps for bw-* runs (can be provided multiple times). "
+            "Default: include all bandwidths."
         ),
     )
     parser.add_argument(
@@ -213,90 +264,6 @@ def _outlier_mask(values: np.ndarray) -> Tuple[np.ndarray, float, float]:
     upper = q3 + 1.5 * iqr
     mask = (values < lower) | (values > upper)
     return mask, lower, upper
-
-
-def plot_elephant_goodput_bar(
-    elephant_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
-) -> None:
-    fig, ax = plt.subplots(figsize=(6, 4))
-    means: List[float] = []
-    stds: List[float] = []
-    labels: List[str] = []
-    colors: List[str] = []
-    for proto in protos:
-        subset = elephant_df[elephant_df["proto"] == proto]
-        if subset.empty:
-            logging.warning("No elephant goodput data for %s", proto)
-            continue
-        labels.append(proto)
-        means.append(subset["goodput_mbps"].mean())
-        stds.append(subset["goodput_mbps"].std(ddof=0))
-        colors.append(_proto_color(proto))
-
-    if not means:
-        ax.text(0.5, 0.5, "No elephant data", ha="center", va="center")
-    else:
-        x = np.arange(len(labels))
-        ax.bar(
-            x,
-            means,
-            yerr=stds,
-            capsize=8,
-            alpha=0.8,
-            color=colors,
-        )
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels)
-        ax.set_ylabel("Goodput (Mbps)")
-        ax.set_title("Elephant Goodput mean (error bars = SD)")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-
-def plot_elephant_goodput_scatter(
-    elephant_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
-) -> None:
-    fig, ax = plt.subplots(figsize=(6, 4))
-    rng = np.random.default_rng(seed=0)
-    has_data = False
-    positions: List[int] = []
-    labels: List[str] = []
-    for idx, proto in enumerate(protos):
-        subset = elephant_df[elephant_df["proto"] == proto]
-        if subset.empty:
-            logging.warning("No elephant goodput data for %s", proto)
-            continue
-        color = _proto_color(proto)
-        positions.append(idx)
-        labels.append(proto)
-        x = np.full(len(subset), idx, dtype=float)
-        if len(subset) > 1:
-            x += rng.uniform(-0.12, 0.12, size=len(subset))
-        ax.scatter(
-            x,
-            subset["goodput_mbps"],
-            alpha=0.8,
-            edgecolors="black",
-            linewidth=0.4,
-            color=color,
-            label=proto,
-        )
-        has_data = True
-
-    if not has_data:
-        ax.text(0.5, 0.5, "No elephant data", ha="center", va="center")
-    else:
-        ax.set_xticks(positions)
-        ax.set_xticklabels(labels)
-        ax.set_ylabel("Goodput (Mbps)")
-        ax.set_title("Elephant Goodput per Flow")
-        ax.grid(True, linestyle="--", alpha=0.4)
-        ax.legend()
-        ax.set_ylim(bottom=0)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
 
 
 def plot_mouse_fct_cdf(
@@ -430,19 +397,22 @@ def _exclude_mouse_warmup_tail(
     df["_flow_seq"] = pd.to_numeric(pair_seqs, errors="coerce")
     mask = pd.Series(True, index=df.index)
 
-    for (proto, run_id, elephant_num, loss_rate), group in df.groupby(
-        ["proto", "run_id", "elephant_num", "loss_rate"],
-        sort=False,
-    ):
+    group_cols = _impairment_group_cols(df)
+    for keys, group in df.groupby(group_cols, sort=False):
+        if len(group_cols) == 5:
+            proto, run_id, elephant_num, kind, value = keys
+        else:
+            proto, run_id, elephant_num, value = keys
+            kind = "loss"
         labels = [p for p in group["_pair_label"].unique() if isinstance(p, str)]
         pair_count = len(labels)
         if pair_count == 0:
             logging.warning(
-                "Unable to infer mouse pairs for %s run %s (E=%s, loss=%s); keeping all flows.",
+                "Unable to infer mouse pairs for %s run %s (E=%s, %s); keeping all flows.",
                 proto,
                 run_id,
                 elephant_num,
-                loss_rate,
+                _impairment_label(kind, value),
             )
             continue
 
@@ -459,12 +429,12 @@ def _exclude_mouse_warmup_tail(
                 pair_group = pair_group.sort_values("_flow_seq", na_position="last")
             else:
                 logging.warning(
-                    "Missing sequence numbers for pair %s in %s run %s (E=%s, loss=%s); skipping warmup/tail exclusion for this pair.",
+                    "Missing sequence numbers for pair %s in %s run %s (E=%s, %s); skipping warmup/tail exclusion for this pair.",
                     pair_label,
                     proto,
                     run_id,
                     elephant_num,
-                    loss_rate,
+                    _impairment_label(kind, value),
                 )
                 continue
 
@@ -478,12 +448,12 @@ def _exclude_mouse_warmup_tail(
 
         if dropped:
             logging.info(
-                "Excluded %d mouse flows for %s run %s (E=%s, loss=%s): lambda=%.3f flows/s, pairs=%d, head=%d, tail=%d.",
+                "Excluded %d mouse flows for %s run %s (E=%s, %s): lambda=%.3f flows/s, pairs=%d, head=%d, tail=%d.",
                 dropped,
                 proto,
                 run_id,
                 elephant_num,
-                loss_rate,
+                _impairment_label(kind, value),
                 mouse_lambda_total,
                 pair_count,
                 head_drop_target,
@@ -494,6 +464,65 @@ def _exclude_mouse_warmup_tail(
     return filtered
 
 
+def _exclude_link_warmup_tail(
+    util_df: pd.DataFrame,
+    *,
+    warmup_s: float,
+    tail_s: float,
+) -> pd.DataFrame:
+    if util_df.empty:
+        return util_df
+    required = {"proto", "run_id", "elapsed_s"}
+    missing = [col for col in required if col not in util_df.columns]
+    if missing:
+        logging.warning(
+            "Link utilization missing columns %s; skipping warmup/tail exclusion.",
+            ", ".join(missing),
+        )
+        return util_df
+
+    df = util_df.copy()
+    df["elapsed_s"] = pd.to_numeric(df["elapsed_s"], errors="coerce")
+    mask = pd.Series(True, index=df.index)
+
+    for (proto, run_id), group in df.groupby(["proto", "run_id"], sort=False):
+        max_elapsed = group["elapsed_s"].max()
+        if pd.isna(max_elapsed):
+            logging.warning(
+                "elapsed_s missing for %s run %s; keeping all link-util samples.",
+                proto,
+                run_id,
+            )
+            continue
+
+        min_keep = warmup_s if warmup_s > 0 else float("-inf")
+        max_keep = max_elapsed - tail_s if tail_s > 0 else max_elapsed
+        keep = (group["elapsed_s"] >= min_keep) & (group["elapsed_s"] <= max_keep)
+        dropped = int((~keep).sum())
+        if dropped:
+            logging.info(
+                "Excluded %d link-util samples for %s run %s: warmup=%.3f s, tail=%.3f s, max_elapsed=%.3f s.",
+                dropped,
+                proto,
+                run_id,
+                warmup_s,
+                tail_s,
+                max_elapsed,
+            )
+        if keep.sum() == 0:
+            logging.warning(
+                "All link-util samples excluded for %s run %s (warmup=%.3f s, tail=%.3f s, max_elapsed=%.3f s).",
+                proto,
+                run_id,
+                warmup_s,
+                tail_s,
+                max_elapsed,
+            )
+        mask.loc[group.index] = keep
+
+    return df[mask]
+
+
 def _count_valid_true(subset: pd.DataFrame, column: str) -> tuple[int, int]:
     if column not in subset.columns:
         return 0, 0
@@ -501,6 +530,86 @@ def _count_valid_true(subset: pd.DataFrame, column: str) -> tuple[int, int]:
     if series.empty:
         return 0, 0
     return int(series.astype(bool).sum()), len(series)
+
+
+def _summarize_link_util_runs(util_df: pd.DataFrame) -> pd.DataFrame:
+    if util_df.empty:
+        return pd.DataFrame(
+            columns=["proto", "run_id", "cv_time_avg", "u_mean_time_avg", "u_max_time_avg"]
+        )
+    required = {"proto", "run_id", "u_mean", "u_max", "cv"}
+    missing = [col for col in required if col not in util_df.columns]
+    if missing:
+        logging.warning("Link utilization summary missing columns: %s", ", ".join(missing))
+        return pd.DataFrame(
+            columns=["proto", "run_id", "cv_time_avg", "u_mean_time_avg", "u_max_time_avg"]
+        )
+
+    df = util_df.copy()
+    df["cv"] = df["cv"].where(df["u_mean"] != 0, np.nan)
+    summary = (
+        df.groupby(["proto", "run_id"], sort=False)
+        .agg(
+            cv_time_avg=("cv", "mean"),
+            u_mean_time_avg=("u_mean", "mean"),
+            u_max_time_avg=("u_max", "mean"),
+        )
+        .reset_index()
+    )
+    return summary
+
+
+def _plot_link_util_run_summaries(
+    run_summary_df: pd.DataFrame,
+    output_root: Path,
+    protos: Sequence[str],
+) -> None:
+    if run_summary_df.empty:
+        logging.warning("No link utilization run summaries to plot.")
+        return
+
+    summary_root = output_root / LINK_UTIL_RUN_SUMMARY_SUBDIR
+    summary_root.mkdir(parents=True, exist_ok=True)
+    summary_specs = [
+        (
+            "cv_time_avg",
+            "Coeff. of variation (time avg)",
+            "cv",
+            "Link utilization CV (per-run time avg)",
+        ),
+        (
+            "u_mean_time_avg",
+            "Mean utilization (time avg)",
+            "u_mean",
+            "Link utilization mean (per-run time avg)",
+        ),
+        (
+            "u_max_time_avg",
+            "Max utilization (time avg)",
+            "u_max",
+            "Link utilization max (per-run time avg)",
+        ),
+    ]
+    for metric, ylabel, prefix, title in summary_specs:
+        metric_df = run_summary_df[run_summary_df[metric].notna()]
+        plot_run_metric_bar(
+            metric_df,
+            summary_root / f"{prefix}_bar.png",
+            protos,
+            metric,
+            ylabel,
+            title=title,
+            proto_colors=PROTO_COLORS,
+        )
+        plot_run_metric_scatter(
+            metric_df,
+            summary_root / f"{prefix}_scatter.png",
+            protos,
+            metric,
+            ylabel,
+            title=title,
+            proto_colors=PROTO_COLORS,
+        )
 
 
 def _plot_link_series(
@@ -596,6 +705,7 @@ def main() -> None:
 
     elephant_filter = args.elephant_num or [DEFAULT_ELEPHANT_NUM]
     loss_rate_filter = args.loss_rate
+    bw_filter = args.bw
 
     output_dir: Path = OUTPUT_ROOT / args.output_dir_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -610,6 +720,7 @@ def main() -> None:
             args.latest_n,
             elephant_filter,
             loss_rate_filter,
+            bw_filter,
         )
     except ValueError as exc:
         logging.error("%s", exc)
@@ -617,11 +728,12 @@ def main() -> None:
 
     if all(not combos for combos in run_dirs_by_proto.values()):
         logging.error(
-            "No run directories selected under %s for protocols: %s (elephant=%s, loss=%s)",
+            "No run directories selected under %s for protocols: %s (elephant=%s, loss=%s, bw=%s)",
             log_root,
             ", ".join(PROTO_ORDER),
             ", ".join(map(str, elephant_filter)),
             ", ".join(map(str, loss_rate_filter)) if loss_rate_filter else "all",
+            ", ".join(map(str, bw_filter)) if bw_filter else "all",
         )
         return
 
@@ -629,29 +741,30 @@ def main() -> None:
         combos = run_dirs_by_proto.get(proto, {})
         if not combos:
             logging.warning(
-                "No runs selected for %s under %s (elephant=%s, loss=%s)",
+                "No runs selected for %s under %s (elephant=%s, loss=%s, bw=%s)",
                 proto,
                 log_root,
                 ", ".join(map(str, elephant_filter)),
                 ", ".join(map(str, loss_rate_filter)) if loss_rate_filter else "all",
+                ", ".join(map(str, bw_filter)) if bw_filter else "all",
             )
             continue
-        for (elephant_num, loss_rate), runs in combos.items():
+        for (elephant_num, kind, value), runs in combos.items():
             if runs:
                 logging.info(
-                    "Using %d run(s) for %s (E=%s, loss=%s%%): %s",
+                    "Using %d run(s) for %s (E=%s, %s): %s",
                     len(runs),
                     proto,
                     elephant_num,
-                    loss_rate,
+                    _impairment_label(kind, value),
                     ", ".join(d.name for d in runs),
                 )
             else:
                 logging.warning(
-                    "No runs selected for %s (E=%s, loss=%s)",
+                    "No runs selected for %s (E=%s, %s)",
                     proto,
                     elephant_num,
-                    loss_rate,
+                    _impairment_label(kind, value),
                 )
 
     data = collect_all_data(log_root, PROTO_ORDER, run_dirs_by_proto)
@@ -669,10 +782,11 @@ def main() -> None:
     combos = _collect_combos(elephant_df, mouse_df, link_df, link_ts_df)
     if not combos:
         logging.error(
-            "No data found under %s for filters elephant=%s, loss=%s",
+            "No data found under %s for filters elephant=%s, loss=%s, bw=%s",
             log_root,
             ", ".join(map(str, elephant_filter)),
             ", ".join(map(str, loss_rate_filter)) if loss_rate_filter else "all",
+            ", ".join(map(str, bw_filter)) if bw_filter else "all",
         )
         return
 
@@ -683,28 +797,16 @@ def main() -> None:
         import mouse_droploss_plot as droploss
         import mouse_retrans_plot as retrans
 
-    for elephant_num, loss_rate in sorted(combos, key=lambda x: (x[0], x[1])):
-        combo_label = f"elephant={elephant_num}, loss={loss_rate}%"
-        combo_output_dir = output_dir / str(elephant_num) / _format_loss_rate_dir(loss_rate)
+    for elephant_num, kind, value in sorted(combos, key=lambda x: (x[0], x[1], x[2])):
+        combo_label = f"elephant={elephant_num}, {_impairment_label(kind, value)}"
+        combo_output_dir = output_dir / str(elephant_num) / _format_impairment_dir(kind, value)
         combo_output_dir.mkdir(parents=True, exist_ok=True)
         logging.info("Analyzing %s -> %s", combo_label, combo_output_dir)
 
-        elephant_combo = elephant_df[
-            (elephant_df["elephant_num"] == elephant_num)
-            & (elephant_df["loss_rate"] == loss_rate)
-        ]
-        mouse_combo = mouse_df[
-            (mouse_df["elephant_num"] == elephant_num)
-            & (mouse_df["loss_rate"] == loss_rate)
-        ]
-        link_combo = link_df[
-            (link_df["elephant_num"] == elephant_num)
-            & (link_df["loss_rate"] == loss_rate)
-        ]
-        link_ts_combo = link_ts_df[
-            (link_ts_df["elephant_num"] == elephant_num)
-            & (link_ts_df["loss_rate"] == loss_rate)
-        ]
+        elephant_combo = _filter_combo(elephant_df, elephant_num, kind, value)
+        mouse_combo = _filter_combo(mouse_df, elephant_num, kind, value)
+        link_combo = _filter_combo(link_df, elephant_num, kind, value)
+        link_ts_combo = _filter_combo(link_ts_df, elephant_num, kind, value)
 
         if (
             elephant_combo.empty
@@ -717,21 +819,31 @@ def main() -> None:
 
         fairness_df = compute_fairness(link_combo)
         util_df = compute_link_util_series(link_ts_combo)
+        util_df = _exclude_link_warmup_tail(
+            util_df,
+            warmup_s=MOUSE_EXCLUDE_HEAD_S,
+            tail_s=MOUSE_EXCLUDE_TAIL_S,
+        )
         u_max_percentiles = compute_u_max_percentiles(util_df)
+        run_summary_df = _summarize_link_util_runs(util_df)
 
         plot_fattree_topology(
             combo_output_dir / f"fattree_topology_k{args.k}.png",
             k=args.k,
         )
-        plot_elephant_goodput_bar(
+        plot_goodput_bar_proto(
             elephant_combo,
             combo_output_dir / "abnormal_elephant_goodput_bar.png",
             PROTO_ORDER,
+            proto_colors=PROTO_COLORS,
+            y_lim=ELEPHANT_GOODPUT_YLIM,
         )
-        plot_elephant_goodput_scatter(
+        plot_goodput_scatter_proto(
             elephant_combo,
             combo_output_dir / "abnormal_elephant_goodput_scatter.png",
             PROTO_ORDER,
+            proto_colors=PROTO_COLORS,
+            y_lim=ELEPHANT_GOODPUT_YLIM,
         )
         plot_mouse_fct_cdf(
             mouse_combo,
@@ -768,6 +880,11 @@ def main() -> None:
             u_max_percentiles,
             output_root=combo_output_dir,
         )
+        _plot_link_util_run_summaries(
+            run_summary_df,
+            combo_output_dir,
+            PROTO_ORDER,
+        )
 
         write_summary(
             combo_output_dir / "abnormal_summary.txt",
@@ -775,14 +892,14 @@ def main() -> None:
             mouse_combo,
             fairness_df,
             PROTO_ORDER,
-            experiment_label=f"Abnormal (E={elephant_num}, loss={loss_rate}%)",
+            experiment_label=f"Abnormal (E={elephant_num}, {_impairment_label(kind, value)})",
         )
 
         droploss_summaries: List[droploss.DropLossSummary] = []
         retrans_summaries: List[retrans.RetransSummary] = []
         for proto in PROTO_ORDER:
             runs = run_dirs_by_proto.get(proto, {}).get(
-                (elephant_num, loss_rate), []
+                (elephant_num, kind, value),
             )
             if not runs:
                 continue
@@ -791,10 +908,10 @@ def main() -> None:
             retrans_flows, retrans_total = _count_valid_true(subset, "had_retrans")
             if drop_total == 0:
                 logging.warning(
-                    "Drop-loss data nodata for %s (E=%s, loss=%s%%): had_drop_retrans all NULL or missing.",
+                    "Drop-loss data nodata for %s (E=%s, %s): had_drop_retrans all NULL or missing.",
                     proto,
                     elephant_num,
-                    loss_rate,
+                    _impairment_label(kind, value),
                 )
             else:
                 droploss_summaries.append(
@@ -807,10 +924,10 @@ def main() -> None:
                 )
             if retrans_total == 0:
                 logging.warning(
-                    "Retrans data nodata for %s (E=%s, loss=%s%%): had_retrans all NULL or missing.",
+                    "Retrans data nodata for %s (E=%s, %s): had_retrans all NULL or missing.",
                     proto,
                     elephant_num,
-                    loss_rate,
+                    _impairment_label(kind, value),
                 )
             else:
                 retrans_summaries.append(
