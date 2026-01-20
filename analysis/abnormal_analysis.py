@@ -535,22 +535,21 @@ def _count_valid_true(subset: pd.DataFrame, column: str) -> tuple[int, int]:
 def _summarize_link_util_runs(util_df: pd.DataFrame) -> pd.DataFrame:
     if util_df.empty:
         return pd.DataFrame(
-            columns=["proto", "run_id", "cv_time_avg", "u_mean_time_avg", "u_max_time_avg"]
+            columns=["proto", "run_id", "std_time_avg", "u_mean_time_avg", "u_max_time_avg"]
         )
-    required = {"proto", "run_id", "u_mean", "u_max", "cv"}
+    required = {"proto", "run_id", "u_mean", "u_max", "std"}
     missing = [col for col in required if col not in util_df.columns]
     if missing:
         logging.warning("Link utilization summary missing columns: %s", ", ".join(missing))
         return pd.DataFrame(
-            columns=["proto", "run_id", "cv_time_avg", "u_mean_time_avg", "u_max_time_avg"]
+            columns=["proto", "run_id", "std_time_avg", "u_mean_time_avg", "u_max_time_avg"]
         )
 
     df = util_df.copy()
-    df["cv"] = df["cv"].where(df["u_mean"] != 0, np.nan)
     summary = (
         df.groupby(["proto", "run_id"], sort=False)
         .agg(
-            cv_time_avg=("cv", "mean"),
+            std_time_avg=("std", "mean"),
             u_mean_time_avg=("u_mean", "mean"),
             u_max_time_avg=("u_max", "mean"),
         )
@@ -572,25 +571,28 @@ def _plot_link_util_run_summaries(
     summary_root.mkdir(parents=True, exist_ok=True)
     summary_specs = [
         (
-            "cv_time_avg",
-            "Coeff. of variation (time avg)",
-            "cv",
-            "Link utilization CV (per-run time avg)",
+            "std_time_avg",
+            "Std dev of utilization (time avg, %)",
+            "std",
+            "Link utilization std dev (per-run time avg)",
+            None,
         ),
         (
             "u_mean_time_avg",
-            "Mean utilization (time avg)",
+            "Mean utilization (time avg, %)",
             "u_mean",
             "Link utilization mean (per-run time avg)",
+            (0.0, 100.0),
         ),
         (
             "u_max_time_avg",
-            "Max utilization (time avg)",
+            "Max utilization (time avg, %)",
             "u_max",
             "Link utilization max (per-run time avg)",
+            (0.0, 100.0),
         ),
     ]
-    for metric, ylabel, prefix, title in summary_specs:
+    for metric, ylabel, prefix, title, y_lim in summary_specs:
         metric_df = run_summary_df[run_summary_df[metric].notna()]
         plot_run_metric_bar(
             metric_df,
@@ -599,6 +601,7 @@ def _plot_link_util_run_summaries(
             metric,
             ylabel,
             title=title,
+            y_lim=y_lim,
             proto_colors=PROTO_COLORS,
         )
         plot_run_metric_scatter(
@@ -608,6 +611,7 @@ def _plot_link_util_run_summaries(
             metric,
             ylabel,
             title=title,
+            y_lim=y_lim,
             proto_colors=PROTO_COLORS,
         )
 
@@ -673,7 +677,7 @@ def plot_link_util_timeseries(
             x,
             sorted_group["u_mean"].to_numpy(),
             title=f"{proto} {run_id} u_mean",
-            ylabel="Mean utilization (fraction)",
+            ylabel="Mean utilization (%)",
             output_path=subdir / "u_mean.png",
         )
 
@@ -684,7 +688,7 @@ def plot_link_util_timeseries(
             x,
             sorted_group["u_max"].to_numpy(),
             title=f"{proto} {run_id} u_max",
-            ylabel="Max utilization (fraction)",
+            ylabel="Max utilization (%)",
             output_path=subdir / "u_max.png",
             p95=p95,
             p99=p99,
@@ -692,10 +696,10 @@ def plot_link_util_timeseries(
 
         _plot_link_series(
             x,
-            sorted_group["cv"].to_numpy(),
-            title=f"{proto} {run_id} CV_u",
-            ylabel="Coeff. of variation",
-            output_path=subdir / "cv.png",
+            sorted_group["std"].to_numpy(),
+            title=f"{proto} {run_id} std_u",
+            ylabel="Std dev of utilization (%)",
+            output_path=subdir / "std.png",
         )
 
 

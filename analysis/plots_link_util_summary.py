@@ -31,6 +31,7 @@ def plot_run_metric_bar(
     ylabel: str,
     *,
     title: str | None = None,
+    y_lim: tuple[float, float] | None = None,
     proto_colors: Mapping[str, str] | None = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -71,6 +72,8 @@ def plot_run_metric_bar(
         ax.set_ylabel(ylabel)
         if title:
             ax.set_title(title)
+        if y_lim is not None:
+            ax.set_ylim(*y_lim)
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
@@ -84,6 +87,7 @@ def plot_run_metric_scatter(
     ylabel: str,
     *,
     title: str | None = None,
+    y_lim: tuple[float, float] | None = None,
     proto_colors: Mapping[str, str] | None = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -129,6 +133,8 @@ def plot_run_metric_scatter(
             ax.set_title(title)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.legend()
+        if y_lim is not None:
+            ax.set_ylim(*y_lim)
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)

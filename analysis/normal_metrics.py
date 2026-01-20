@@ -45,18 +45,18 @@ def compute_fairness(link_df: pd.DataFrame) -> pd.DataFrame:
 def compute_link_util_series(link_ts_df: pd.DataFrame) -> pd.DataFrame:
     if link_ts_df.empty:
         return pd.DataFrame(
-            columns=["proto", "run_id", "sample_idx", "elapsed_s", "u_mean", "u_max", "cv"]
+            columns=["proto", "run_id", "sample_idx", "elapsed_s", "u_mean", "u_max", "std"]
         )
     required = ["proto", "run_id", "sample_idx", "elapsed_s", "u_l"]
     missing = [col for col in required if col not in link_ts_df.columns]
     if missing:
         logging.warning("Link timeseries missing columns: %s", ", ".join(missing))
         return pd.DataFrame(
-            columns=["proto", "run_id", "sample_idx", "elapsed_s", "u_mean", "u_max", "cv"]
+            columns=["proto", "run_id", "sample_idx", "elapsed_s", "u_mean", "u_max", "std"]
         )
 
     df = link_ts_df.copy()
-    df["u_l"] = pd.to_numeric(df["u_l"], errors="coerce")
+    df["u_l"] = pd.to_numeric(df["u_l"], errors="coerce") * 100.0
     df["elapsed_s"] = pd.to_numeric(df["elapsed_s"], errors="coerce")
 
     rows: List[Dict[str, object]] = []
@@ -68,7 +68,7 @@ def compute_link_util_series(link_ts_df: pd.DataFrame) -> pd.DataFrame:
         elapsed = float(elapsed_vals.max()) if elapsed_vals.size else float("nan")
         u_mean = float(values.mean())
         u_max = float(values.max())
-        cv = float(values.std(ddof=0) / u_mean) if u_mean > 0 else 0.0
+        u_std = float(values.std(ddof=0))
         rows.append(
             {
                 "proto": proto,
@@ -77,7 +77,7 @@ def compute_link_util_series(link_ts_df: pd.DataFrame) -> pd.DataFrame:
                 "elapsed_s": elapsed,
                 "u_mean": u_mean,
                 "u_max": u_max,
-                "cv": cv,
+                "std": u_std,
             }
         )
     return pd.DataFrame(rows)
