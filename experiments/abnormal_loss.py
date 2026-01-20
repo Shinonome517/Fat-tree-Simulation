@@ -328,15 +328,34 @@ class LinkSampler:
     def stop(self) -> None:
         self._stop.set()
         if self._thread.is_alive():
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                print(f"{self.run_tag} link sampler: stop timed out; thread still alive.")
 
     def _read_tx(self) -> Dict[str, float]:
         readings: Dict[str, float] = {}
         for node, names in self._interface_map.items():
             if not names:
                 continue
-            paths = " ".join(f"/sys/class/net/{n}/statistics/tx_bytes" for n in names)
-            raw = node.cmd(f"cat {paths} 2>/dev/null").strip().split()
+            paths = [f"/sys/class/net/{n}/statistics/tx_bytes" for n in names]
+            proc = None
+            try:
+                proc = node.popen(
+                    ["cat", *paths],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                out, _ = proc.communicate(timeout=1.0)
+            except Exception:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        proc.communicate(timeout=1.0)
+                    except Exception:
+                        pass
+                continue
+            raw = (out or "").strip().split()
             if len(raw) != len(names):
                 continue
             for name, val in zip(names, raw):
@@ -356,28 +375,31 @@ class LinkSampler:
         last_time = start_time
         sample_idx = 0
 
-        with self.log_path.open("w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["sample_idx", "elapsed_s", "if_name", "delta_tx_bytes", "u_l", "dt_s"])
-            while not self._stop.wait(self.interval_s):
-                now = time.perf_counter()
-                dt = now - last_time
-                if dt <= 0:
-                    continue
-                curr = self._read_tx()
-                if not curr:
-                    continue
-                elapsed = now - start_time
-                for if_name in sorted(prev.keys()):
-                    curr_val = curr.get(if_name)
-                    if curr_val is None:
+        try:
+            with self.log_path.open("w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["sample_idx", "elapsed_s", "if_name", "delta_tx_bytes", "u_l", "dt_s"])
+                while not self._stop.wait(self.interval_s):
+                    now = time.perf_counter()
+                    dt = now - last_time
+                    if dt <= 0:
                         continue
-                    delta = max(0.0, curr_val - prev.get(if_name, 0.0))
-                    util = (delta * 8.0) / (self.bw_mbps * 1_000_000 * dt)
-                    writer.writerow([sample_idx, elapsed, if_name, delta, util, dt])
-                prev = curr
-                last_time = now
-                sample_idx += 1
+                    curr = self._read_tx()
+                    if not curr:
+                        continue
+                    elapsed = now - start_time
+                    for if_name in sorted(prev.keys()):
+                        curr_val = curr.get(if_name)
+                        if curr_val is None:
+                            continue
+                        delta = max(0.0, curr_val - prev.get(if_name, 0.0))
+                        util = (delta * 8.0) / (self.bw_mbps * 1_000_000 * dt)
+                        writer.writerow([sample_idx, elapsed, if_name, delta, util, dt])
+                    prev = curr
+                    last_time = now
+                    sample_idx += 1
+        except Exception as exc:
+            print(f"{self.run_tag} link sampler: crashed: {exc}")
 
 
 def _terminate_processes(procs: List[object], term_timeout: float = DEFAULT_KILL_GRACE_SECONDS) -> None:
@@ -1186,7 +1208,7 @@ def run_abnormal_once(
         all_mouse_procs: List[object] = [proc for plist in mouse_proc_lists for proc in plist]
         _terminate_processes(all_mouse_procs, term_timeout=DEFAULT_KILL_GRACE_SECONDS)
 
-        # Stop link sampler before snapshot to avoid node.cmd contention with snapshot_switch_bytes.
+        # Stop link sampler before snapshot to finalize the timeseries and reduce background load.
         if link_sampler:
             link_sampler.stop()
 
