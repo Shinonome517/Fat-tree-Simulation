@@ -1,8 +1,8 @@
 """Abnormal loss injection experiments (Blackbox-derived; adds TCP/MPTCP).
 
 This module launches random Elephant/Mouse flows across the Fat-Tree, injects
-temporary loss on a specific link, and captures switch statistics to compare
-QUIC/MPQUIC/TCP/MPTCP under ECMP.
+static loss on a specific link before traffic starts, and captures switch
+statistics to compare QUIC/MPQUIC/TCP/MPTCP under ECMP.
 """
 
 import argparse
@@ -44,8 +44,6 @@ WARMUP_SECONDS = 1.0
 ELEPHANT_CLIENT_TIMEOUT_S = 120.0  # watchdog for elephant clients after traffic start
 ELEPHANT_MBYTES = 1000
 
-LOSS_INJECT_START_S = 2.0
-LOSS_DURATION_S = 4.0
 LOSS_TARGET_POD = 0
 LOSS_TARGET_AGG = 1
 LOSS_TARGET_CORE = 3
@@ -91,9 +89,6 @@ ROLE_ELEPHANT_CLIENT = "elephant-client"
 ROLE_MOUSE_SERVER = "mouse-server"
 ROLE_MOUSE_CLIENT = "mouse-client"
 HOSTNAME_RE = re.compile(r"h(\d+)(\d)(\d)$")
-NETEM_QDISC_RE = re.compile(r"qdisc\s+netem\s+(?P<handle>\S+)\s+parent\s+(?P<parent>\S+)")
-
-
 def _format_extra_args(extra_args: Union[Iterable[str], str, None]) -> str:
     if not extra_args:
         return ""
@@ -114,34 +109,7 @@ def _format_loss_rate_dir(loss_rate: float) -> str:
     return f"{loss_rate:g}"
 
 
-def _append_loss_log(log_path: Path, message: str) -> None:
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    with log_path.open("a") as f:
-        f.write(f"[{timestamp}] {message}\n")
-
-
-def _netem_parent_handle(node, intf_name: str) -> Tuple[Optional[str], Optional[str]]:
-    out = node.cmd(f"tc qdisc show dev {intf_name} 2>/dev/null").strip()
-    for line in out.splitlines():
-        match = NETEM_QDISC_RE.search(line)
-        if match:
-            return match.group("parent"), match.group("handle")
-    return None, None
-
-
-def _netem_args(link_params: Dict[str, object], loss_rate: float) -> str:
-    parts: List[str] = []
-    delay = link_params.get("delay")
-    if delay is not None:
-        parts.append(f"delay {delay}")
-    parts.append(f"loss {loss_rate:.5f}")
-    max_queue_size = link_params.get("max_queue_size")
-    if max_queue_size is not None:
-        parts.append(f"limit {int(max_queue_size)}")
-    return " ".join(parts)
-
-
-def _loss_target_interfaces(ctx) -> List[Tuple[object, str]]:
+def _loss_target_interfaces(ctx) -> List[object]:
     try:
         agg_node = ctx.aggs[LOSS_TARGET_POD][LOSS_TARGET_AGG]
     except Exception as exc:
@@ -155,43 +123,24 @@ def _loss_target_interfaces(ctx) -> List[Tuple[object, str]]:
 
     agg_if = f"a{LOSS_TARGET_POD}{LOSS_TARGET_AGG}-to-c{LOSS_TARGET_CORE}"
     core_if = f"c{LOSS_TARGET_CORE}-to-a{LOSS_TARGET_POD}{LOSS_TARGET_AGG}"
-    if agg_node.intf(agg_if) is None:
+    agg_intf = agg_node.intf(agg_if)
+    core_intf = core_node.intf(core_if)
+    if agg_intf is None:
         raise RuntimeError(f"Interface {agg_if} not found on {agg_node.name}")
-    if core_node.intf(core_if) is None:
+    if core_intf is None:
         raise RuntimeError(f"Interface {core_if} not found on {core_node.name}")
-    return [(agg_node, agg_if), (core_node, core_if)]
+    return [agg_intf, core_intf]
 
 
-def _set_loss_on_targets(
-    targets: List[Tuple[object, str]],
-    link_params: Dict[str, object],
-    loss_rate: float,
-    log_path: Path,
+def _apply_static_loss(
+    intfs: Sequence[object], link_params: Dict[str, object], loss_rate: float
 ) -> None:
-    netem_args = _netem_args(link_params, loss_rate)
-    for node, intf_name in targets:
-        if node.intf(intf_name) is None:
-            raise RuntimeError(f"Interface {intf_name} not found on {node.name}")
-        parent, handle = _netem_parent_handle(node, intf_name)
-        parent = parent or "5:1"
-        handle = handle or "10:"
-        cmd = f"tc qdisc change dev {intf_name} parent {parent} handle {handle} netem {netem_args}"
-        out = node.cmd(cmd + " 2>&1").strip()
-        if out:
-            _append_loss_log(log_path, f"{node.name}:{intf_name} netem change output: {out}")
-            raise RuntimeError(
-                f"tc qdisc change failed for {node.name}:{intf_name}: {out}"
-            )
-        _append_loss_log(
-            log_path, f"{node.name}:{intf_name} loss={loss_rate:.3f}% applied"
-        )
-
-
-def _elephant_in_progress(procs: Sequence[object]) -> bool:
-    for proc in procs:
-        if proc and proc.poll() is None:
-            return True
-    return False
+    cfg: Dict[str, object] = {"loss": loss_rate}
+    for key in ("bw", "delay", "max_queue_size", "use_htb"):
+        if key in link_params:
+            cfg[key] = link_params[key]
+    for intf in intfs:
+        intf.config(**cfg)
 
 
 def _mark_run_invalid(log_dir: Path, run_tag: str, reason: str) -> None:
@@ -927,7 +876,6 @@ def run_abnormal_once(
         suffix=f"seed{seed}",
         extra_parts=[str(elephant_num), _format_loss_rate_dir(loss_rate)],
     )
-    loss_log_path = log_dir / "loss_injection.log"
 
     ctx = None
     server_procs: List[object] = []
@@ -937,8 +885,6 @@ def run_abnormal_once(
     mouse_stop = threading.Event()
     all_mouse_procs: List[object] = []
     link_sampler: Optional[LinkSampler] = None
-    loss_targets: List[Tuple[object, str]] = []
-    loss_applied = False
     def _ensure_servers_alive(context: str) -> None:
         dead = [proc for proc in server_procs if proc and proc.poll() is not None]
         if dead:
@@ -952,6 +898,18 @@ def run_abnormal_once(
         hosts_flat = [h for pod in ctx.hosts for edge in pod for h in edge]
         print(f"{run_tag} hosts ready: {len(hosts_flat)} total.")
         _apply_tcp_sysctls(hosts_flat, proto)
+        try:
+            loss_intfs = _loss_target_interfaces(ctx)
+            _apply_static_loss(loss_intfs, ctx.link_params, loss_rate)
+            print(
+                f"{run_tag} loss={loss_rate:.3f}% applied on "
+                f"a{LOSS_TARGET_POD}{LOSS_TARGET_AGG}-c{LOSS_TARGET_CORE} before traffic."
+            )
+        except Exception as exc:
+            reason = f"Static loss apply failed: {exc}"
+            print(f"{run_tag} {reason}", file=sys.stderr)
+            _mark_run_invalid(log_dir, run_tag, reason)
+            return
 
         ele_src_pool = mouse_src_pool = hosts_flat
 
@@ -1199,55 +1157,6 @@ def run_abnormal_once(
             mouse_threads.append(thread)
             thread.start()
 
-        inject_time = start_time + LOSS_INJECT_START_S
-        sleep_time = inject_time - time.time()
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-
-        if not _elephant_in_progress(elephant_procs):
-            reason = (
-                f"Elephant not in progress at t={LOSS_INJECT_START_S:.1f}s; marking run invalid."
-            )
-            print(f"{run_tag} {reason}")
-            _append_loss_log(loss_log_path, reason)
-            _mark_run_invalid(log_dir, run_tag, reason)
-            mouse_stop.set()
-            return
-
-        try:
-            loss_targets = _loss_target_interfaces(ctx)
-            _append_loss_log(
-                loss_log_path,
-                (
-                    f"Injecting loss={loss_rate:.3f}% on "
-                    f"a{LOSS_TARGET_POD}{LOSS_TARGET_AGG}-c{LOSS_TARGET_CORE} "
-                    f"from t={LOSS_INJECT_START_S:.1f}s to t={LOSS_INJECT_START_S + LOSS_DURATION_S:.1f}s."
-                ),
-            )
-            _set_loss_on_targets(loss_targets, ctx.link_params, loss_rate, loss_log_path)
-            loss_applied = True
-        except Exception as exc:
-            reason = f"Loss injection failed: {exc}"
-            print(f"{run_tag} {reason}", file=sys.stderr)
-            _append_loss_log(loss_log_path, reason)
-            _mark_run_invalid(log_dir, run_tag, reason)
-            mouse_stop.set()
-            return
-
-        end_time = start_time + LOSS_INJECT_START_S + LOSS_DURATION_S
-        sleep_time = end_time - time.time()
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-        try:
-            _set_loss_on_targets(loss_targets, ctx.link_params, 0.0, loss_log_path)
-            loss_applied = False
-            _append_loss_log(loss_log_path, "Loss cleared (restored to 0.0%).")
-        except Exception as exc:
-            reason = f"Loss clear failed: {exc}"
-            print(f"{run_tag} {reason}", file=sys.stderr)
-            _append_loss_log(loss_log_path, reason)
-            _mark_run_invalid(log_dir, run_tag, reason)
-
         print(f"{run_tag} traffic running; waiting for elephant completion (timeout {ELEPHANT_CLIENT_TIMEOUT_S:.0f}s).")
         elephant_deadline = start_time + ELEPHANT_CLIENT_TIMEOUT_S
         while time.time() < elephant_deadline:
@@ -1298,15 +1207,6 @@ def run_abnormal_once(
             elephant_procs + server_procs + all_mouse_procs,
             term_timeout=DEFAULT_KILL_GRACE_SECONDS,
         )
-        if loss_applied and ctx:
-            try:
-                _set_loss_on_targets(loss_targets, ctx.link_params, 0.0, loss_log_path)
-                _append_loss_log(loss_log_path, "Loss cleared during teardown.")
-            except Exception as exc:
-                reason = f"Loss clear during teardown failed: {exc}"
-                print(f"{run_tag} {reason}", file=sys.stderr)
-                _append_loss_log(loss_log_path, reason)
-                _mark_run_invalid(log_dir, run_tag, reason)
         if link_sampler:
             link_sampler.stop()
         stop_fattree_topology(ctx)
