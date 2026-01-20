@@ -464,6 +464,8 @@ def _apply_tcp_sysctls(hosts: Sequence, proto: str) -> None:
     for host in hosts:
         for key, val in settings.items():
             host.cmd(f"sysctl -w {key}={val}")
+        if proto == "mptcp":
+            host.cmd("ip mptcp limits set subflow 3 2>/dev/null || true")
 
 
 def get_extra_args(proto: str, role: str, alt_addrs: Optional[str] = None) -> List[str]:
@@ -544,11 +546,10 @@ def _ensure_mptcp_endpoints(host, iface: Optional[str], coords: Optional[Tuple[i
     alt_ips = _extra_host_ips(coords)
     if not alt_ips or not iface:
         return
-    host.cmd("ip mptcp limits set add_addr_accepted 4 subflow 4 signal 4 2>/dev/null || true")
     for ip in alt_ips:
         host.cmd(
             f"ip mptcp endpoint show | grep -w '{ip}' >/dev/null 2>&1 || "
-            f"ip mptcp endpoint add {ip} dev {iface} signal"
+            f"ip mptcp endpoint add {ip} dev {iface} subflow"
         )
 
 
