@@ -26,7 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from fattree_heatmap import plot_fattree_heatmap, plot_fattree_topology
-from plots_goodput import plot_goodput_bar_proto, plot_goodput_scatter_proto
+from plots_goodput import plot_goodput_violin_proto
 from plots_link import plot_link_heatmap
 from plots_link_util_summary import plot_run_metric_bar, plot_run_metric_scatter
 from scatter import plot_run_p99_scatter
@@ -788,16 +788,9 @@ def main() -> None:
             combo_output_dir / f"fattree_topology_k{args.k}.png",
             k=args.k,
         )
-        plot_goodput_bar_proto(
+        plot_goodput_violin_proto(
             elephant_combo,
-            combo_output_dir / "normal_elephant_goodput_bar.png",
-            PROTO_ORDER,
-            proto_colors=PROTO_COLORS,
-            y_lim=ELEPHANT_GOODPUT_YLIM,
-        )
-        plot_goodput_scatter_proto(
-            elephant_combo,
-            combo_output_dir / "normal_elephant_goodput_scatter.png",
+            combo_output_dir / "normal_elephant_goodput_violin.png",
             PROTO_ORDER,
             proto_colors=PROTO_COLORS,
             y_lim=ELEPHANT_GOODPUT_YLIM,
