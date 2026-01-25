@@ -13,9 +13,9 @@ __all__ = ['parse_args', 'main']
 
 def parse_args():
     parser = argparse.ArgumentParser(description='FatTree Mininet topology (headless by default).')
-    parser.add_argument('--bw', type=int, default=1000, help='Link bandwidth in Mbps (default: 1000).')
-    parser.add_argument('--delay', default='0.2ms', help="Link delay applied to all links (default: '0.2ms').")
-    parser.add_argument('--q', type=int, default=150, metavar='PKTS', help='Max queue size in packets (default: 150).')
+    parser.add_argument('--bw', type=int, default=100, help='Link bandwidth in Mbps (default: 100).')
+    parser.add_argument('--delay', default='0.5ms', help="Link delay applied to all links (default: '0.5ms').")
+    parser.add_argument('--q', type=int, default=50, metavar='PKTS', help='Max queue size in packets (default: 50).')
     parser.add_argument(
         '-k',
         '--k',

@@ -31,7 +31,9 @@ from experiments import (
 from topology import host_ips, stop_fattree_topology
 
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario
-DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
+DEFAULT_LINK_BW_MBPS = 100  # keep in sync with create_fattree call
+DEFAULT_LINK_DELAY_MS = 0.5
+DEFAULT_SWITCH_QUEUE_PKTS = 50
 DEFAULT_KILL_GRACE_SECONDS = 3.0  # grace before SIGKILL when stopping processes
 SERVER_IDLE_TIMEOUT_MS = 5000
 CONGESTION_CONTROL = "cubic"
@@ -65,7 +67,7 @@ TCP_MOUSE_CHUNK_SIZE = 64 * 1024
 MOUSE_PAIR_COUNT = 10
 ELEPHANT_PORT = 4443
 MOUSE_PORT = 4444
-MOUSE_TOTAL_LAMBDA = 160.0
+MOUSE_TOTAL_LAMBDA = 16.0
 MOUSE_HEARTBEAT_INTERVAL = 10.0
 MOUSE_SIZE_MIN = 4 * 1024
 MOUSE_SIZE_MAX = 64 * 1024
@@ -917,7 +919,12 @@ def run_abnormal_once(
             )
 
     try:
-        ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=50)
+        ctx = create_fattree(
+            k=k,
+            bw_mbps=DEFAULT_LINK_BW_MBPS,
+            delay=DEFAULT_LINK_DELAY_MS,
+            queue_pkts=DEFAULT_SWITCH_QUEUE_PKTS,
+        )
         hosts_flat = [h for pod in ctx.hosts for edge in pod for h in edge]
         print(f"{run_tag} hosts ready: {len(hosts_flat)} total.")
         _apply_tcp_sysctls(hosts_flat, proto)

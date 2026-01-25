@@ -46,7 +46,9 @@ ELEPHANT_PORT = 4443
 MOUSE_PORT = 4444
 DEFAULT_SEED = 12345
 DEFAULT_SCENARIO = "*1:1000:1000;"  # minimal valid perf scenario (1 stream, 1KB each way)
-DEFAULT_LINK_BW_MBPS = 1000  # keep in sync with create_fattree call
+DEFAULT_LINK_BW_MBPS = 100  # keep in sync with create_fattree call
+DEFAULT_LINK_DELAY_MS = 0.5
+DEFAULT_SWITCH_QUEUE_PKTS = 50
 DEFAULT_ELEPHANT_LOAD_FRAC = 0.7  # fraction of link capacity to target when auto-sizing Elephant payload
 MOUSE_SIZE_BYTES = 64 * 1024
 MOUSE_PERIOD_S = 0.20
@@ -719,7 +721,12 @@ def run_incast_once(
     grid_t0: Optional[float] = None
 
     try:
-        ctx = create_fattree(k=k, bw_mbps=DEFAULT_LINK_BW_MBPS, delay="0.05ms", queue_pkts=50)
+        ctx = create_fattree(
+            k=k,
+            bw_mbps=DEFAULT_LINK_BW_MBPS,
+            delay=DEFAULT_LINK_DELAY_MS,
+            queue_pkts=DEFAULT_SWITCH_QUEUE_PKTS,
+        )
         print(f"{run_tag} topology ready.")
 
         elephant_client = ctx.net.get(ELEPHANT_HOSTNAME)
