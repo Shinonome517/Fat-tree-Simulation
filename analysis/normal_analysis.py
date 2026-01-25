@@ -49,7 +49,7 @@ PROTO_COLORS = {
     "quic": "#17becf",
     "mpquic": "#ff7f0e",
 }
-ELEPHANT_GOODPUT_YLIM = (0, 1000)
+ELEPHANT_GOODPUT_YLIM = (0, 100)
 MOUSE_DROPLOSS_FILENAME = "normal_mouse_droploss_ratio.png"
 MOUSE_RETRANS_FILENAME = "normal_mouse_retrans_ratio.png"
 LINK_UTIL_SUBDIR = Path("link_utilization")
