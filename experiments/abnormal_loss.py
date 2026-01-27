@@ -44,7 +44,7 @@ PYTHON_BIN = "/usr/bin/python3"  # Use absolute python path inside Mininet hosts
 LINK_SAMPLE_INTERVAL_S = 0.1
 WARMUP_SECONDS = 1.0
 ELEPHANT_CLIENT_TIMEOUT_S = 120.0  # watchdog for elephant clients after traffic start
-ELEPHANT_MBYTES = 1000
+ELEPHANT_MBYTES = 100
 
 LOSS_TARGET_POD = 0
 LOSS_TARGET_AGG = 1
