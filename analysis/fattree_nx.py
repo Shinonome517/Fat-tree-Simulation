@@ -104,10 +104,15 @@ def fattree_layout(G, k=4):
     y_edge = 1.0
     y_host = 0.0
 
-    node_gap = 1.0
-    host_gap = 0.3
-    pod_gap = max(n_edge_per_pod, n_agg_per_pod) * node_gap + 2.0
-    core_group_gap = 0.5
+    # Expand pod width horizontally by spacing edge switches further apart.
+    agg_gap = 3.2
+    edge_gap = 3.2
+    # Spread hosts horizontally to reduce overlap under edge switches.
+    host_gap = 1.6
+    pod_gap = max(n_edge_per_pod * edge_gap, n_agg_per_pod * agg_gap) + 4.0
+    # Keep core switches readable when the overall width increases.
+    core_gap = 3.2
+    core_group_gap = 6.0
 
     positions = {}
     core_center = ((n_pods - 1) * pod_gap) / 2
@@ -117,25 +122,25 @@ def fattree_layout(G, k=4):
         if layer == "core":
             idx = data.get("idx", 0)
             group = data.get("group", 0)
-            x = core_center + idx * node_gap
+            x = core_center + idx * core_gap
             if n_core_groups > 1:
                 x += (group - (n_core_groups - 1) / 2) * core_group_gap
             y = y_core
         elif layer == "agg":
             pod = data.get("pod", 0)
             idx = data.get("idx", 0)
-            x = pod * pod_gap + idx * node_gap
+            x = pod * pod_gap + idx * agg_gap
             y = y_agg
         elif layer == "edge":
             pod = data.get("pod", 0)
             idx = data.get("idx", 0)
-            x = pod * pod_gap + idx * node_gap
+            x = pod * pod_gap + idx * edge_gap
             y = y_edge
         elif layer == "host":
             pod = data.get("pod", 0)
             edge_idx = data.get("edge_idx", 0)
             h_idx = data.get("idx", 0)
-            x = pod * pod_gap + edge_idx * node_gap
+            x = pod * pod_gap + edge_idx * edge_gap
             if n_hosts_per_edge > 1:
                 x += (h_idx - (n_hosts_per_edge - 1) / 2) * host_gap
             y = y_host

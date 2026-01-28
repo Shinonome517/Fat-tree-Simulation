@@ -357,10 +357,6 @@ def plot_mouse_fct_cdf(
     else:
         ax.set_xlabel(f"FCT ({unit_label})")
         ax.set_ylabel("CDF")
-        title = "Mouse FCT CDF"
-        if exclude_outliers:
-            title += " (outliers removed, <=p99)"
-        ax.set_title(title)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.legend()
     fig.tight_layout()
@@ -941,7 +937,6 @@ def main() -> None:
                 droploss_summaries,
                 output_dir=combo_output_dir,
                 filename=MOUSE_DROPLOSS_FILENAME,
-                title="Mouse drop-induced retransmissions",
                 color_map=PROTO_COLORS,
             )
             drop_flows = sum(s.drop_flows for s in droploss_summaries)
@@ -961,7 +956,6 @@ def main() -> None:
                 retrans_summaries,
                 output_dir=combo_output_dir,
                 filename=MOUSE_RETRANS_FILENAME,
-                title="Mouse retransmission ratio",
                 color_map=PROTO_COLORS,
             )
             retrans_flows = sum(s.retrans_flows for s in retrans_summaries)

@@ -216,7 +216,6 @@ def plot_goodput_violin_proto(
     ax.set_xticks(positions)
     ax.set_xticklabels(labels)
     ax.set_ylabel("Goodput (Mbps)")
-    ax.set_title("Elephant Goodput Distribution")
     if y_lim is not None:
         ax.set_ylim(y_lim)
     fig.tight_layout()

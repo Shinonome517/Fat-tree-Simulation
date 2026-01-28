@@ -56,7 +56,9 @@ def _draw_topology(
     ax: plt.Axes,
     *,
     node_size: float = 120,
+    host_node_size: float | None = None,
     node_color: str = "#dddddd",
+    host_node_color: str | None = None,
     node_edgecolor: str = "#666666",
     edge_color: str = "#888888",
     edge_width: float = 1.5,
@@ -64,45 +66,51 @@ def _draw_topology(
     with_labels: bool = True,
 ) -> None:
     """Draw a fat-tree topology without load overlays for reuse across plots."""
-    nx.draw_networkx_nodes(
-        G,
-        pos=pos,
-        ax=ax,
-        node_size=node_size,
-        node_color=node_color,
-        edgecolors=node_edgecolor,
-        linewidths=0.5,
-    )
+    separate_hosts = False
+    if host_node_size is not None and host_node_size != node_size:
+        separate_hosts = True
+    if host_node_color is not None and host_node_color != node_color:
+        separate_hosts = True
+
+    if not separate_hosts:
+        nx.draw_networkx_nodes(
+            G,
+            pos=pos,
+            ax=ax,
+            node_size=node_size,
+            node_color=node_color,
+            edgecolors=node_edgecolor,
+            linewidths=0.5,
+        )
+    else:
+        host_nodes = [n for n, d in G.nodes(data=True) if d.get("layer") == "host"]
+        other_nodes = [n for n in G.nodes() if n not in host_nodes]
+        if other_nodes:
+            nx.draw_networkx_nodes(
+                G,
+                pos=pos,
+                ax=ax,
+                nodelist=other_nodes,
+                node_size=node_size,
+                node_color=node_color,
+                edgecolors=node_edgecolor,
+                linewidths=0.5,
+            )
+        if host_nodes:
+            nx.draw_networkx_nodes(
+                G,
+                pos=pos,
+                ax=ax,
+                nodelist=host_nodes,
+                node_size=host_node_size if host_node_size is not None else node_size,
+                node_color=host_node_color if host_node_color is not None else node_color,
+                edgecolors=node_edgecolor,
+                linewidths=0.5,
+            )
     if draw_edges:
         nx.draw_networkx_edges(G, pos=pos, ax=ax, edge_color=edge_color, width=edge_width)
     if with_labels:
         nx.draw_networkx_labels(G, pos=pos, ax=ax, font_size=7)
-
-
-def _host_label_positions(
-    G: nx.Graph,
-    pos: Mapping[str, Tuple[float, float]],
-    *,
-    spread: float = 2.0,
-    max_offset: float = 0.35,
-    y_offset: float = 0.0,
-) -> Dict[str, Tuple[float, float]]:
-    """Return label positions with hosts spread horizontally to reduce overlap."""
-    host_pos: Dict[str, Tuple[float, float]] = {}
-    for node, data in G.nodes(data=True):
-        if data.get("layer") != "host":
-            continue
-        x, y = pos[node]
-        pod = data.get("pod")
-        edge_idx = data.get("edge_idx")
-        edge_node = f"e{pod}{edge_idx}" if pod is not None and edge_idx is not None else None
-        edge_x = pos.get(edge_node, (x, y))[0] if edge_node else x
-        offset_x = x - edge_x
-        if offset_x != 0.0:
-            scale = max(1.0, min(spread, max_offset / abs(offset_x)))
-            x = edge_x + offset_x * scale
-        host_pos[node] = (x, y + y_offset)
-    return host_pos
 
 
 def aggregate_link_loads(
@@ -188,7 +196,15 @@ def plot_fattree_heatmap(
 
     for ax, proto in zip(axes, protos):
         loads = agg.get(proto, {}) or {}
-        _draw_topology(G, pos, ax=ax, draw_edges=False, with_labels=False)
+        _draw_topology(
+            G,
+            pos,
+            ax=ax,
+            draw_edges=False,
+            with_labels=False,
+            node_color="#e0cfcf",
+            host_node_color="#dddddd",
+        )
 
         edges = list(G.edges())
         edge_loads = [float(loads.get(_edge_key(*edge), 0.0)) for edge in edges]
@@ -241,8 +257,10 @@ def plot_fattree_topology(
         G,
         pos,
         ax=ax,
-        node_size=120,
-        node_color="#dddddd",
+        node_size=180,
+        host_node_size=300,
+        node_color="#e0cfcf",
+        host_node_color="#dddddd",
         node_edgecolor="#666666",
         edge_color="#888888",
         edge_width=1.5,
@@ -256,10 +274,9 @@ def plot_fattree_topology(
             }
             nx.draw_networkx_labels(G, pos=pos, ax=ax, labels=non_host_labels, font_size=7)
             host_labels = {n: n for n in host_nodes}
-            host_pos = _host_label_positions(G, pos)
             nx.draw_networkx_labels(
                 G,
-                pos=host_pos,
+                pos=pos,
                 ax=ax,
                 labels=host_labels,
                 font_size=6,
