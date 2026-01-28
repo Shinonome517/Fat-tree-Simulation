@@ -79,6 +79,32 @@ def _draw_topology(
         nx.draw_networkx_labels(G, pos=pos, ax=ax, font_size=7)
 
 
+def _host_label_positions(
+    G: nx.Graph,
+    pos: Mapping[str, Tuple[float, float]],
+    *,
+    spread: float = 2.0,
+    max_offset: float = 0.35,
+    y_offset: float = 0.0,
+) -> Dict[str, Tuple[float, float]]:
+    """Return label positions with hosts spread horizontally to reduce overlap."""
+    host_pos: Dict[str, Tuple[float, float]] = {}
+    for node, data in G.nodes(data=True):
+        if data.get("layer") != "host":
+            continue
+        x, y = pos[node]
+        pod = data.get("pod")
+        edge_idx = data.get("edge_idx")
+        edge_node = f"e{pod}{edge_idx}" if pod is not None and edge_idx is not None else None
+        edge_x = pos.get(edge_node, (x, y))[0] if edge_node else x
+        offset_x = x - edge_x
+        if offset_x != 0.0:
+            scale = max(1.0, min(spread, max_offset / abs(offset_x)))
+            x = edge_x + offset_x * scale
+        host_pos[node] = (x, y + y_offset)
+    return host_pos
+
+
 def aggregate_link_loads(
     link_df: pd.DataFrame,
     protos: Sequence[str],
@@ -220,8 +246,26 @@ def plot_fattree_topology(
         node_edgecolor="#666666",
         edge_color="#888888",
         edge_width=1.5,
-        with_labels=with_labels,
+        with_labels=False,
     )
+    if with_labels:
+        host_nodes = {n for n, d in G.nodes(data=True) if d.get("layer") == "host"}
+        if host_nodes:
+            non_host_labels = {
+                n: n for n, d in G.nodes(data=True) if d.get("layer") != "host"
+            }
+            nx.draw_networkx_labels(G, pos=pos, ax=ax, labels=non_host_labels, font_size=7)
+            host_labels = {n: n for n in host_nodes}
+            host_pos = _host_label_positions(G, pos)
+            nx.draw_networkx_labels(
+                G,
+                pos=host_pos,
+                ax=ax,
+                labels=host_labels,
+                font_size=6,
+            )
+        else:
+            nx.draw_networkx_labels(G, pos=pos, ax=ax, font_size=7)
     ax.axis("off")
 
     fig.tight_layout()
