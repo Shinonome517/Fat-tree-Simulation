@@ -17,6 +17,10 @@ use_agg_backend()
 import matplotlib.pyplot as plt  # noqa: E402
 
 
+def _display_proto_label(proto: str) -> str:
+    return str(proto).upper()
+
+
 def plot_goodput_bar(
     elephant_df: pd.DataFrame, output_path: Path, protos: Sequence[str]
 ) -> None:
@@ -166,7 +170,7 @@ def plot_goodput_violin_proto(
             continue
         datasets.append(subset["goodput_mbps"].to_numpy())
         positions.append(idx)
-        labels.append(proto)
+        labels.append(_display_proto_label(proto))
         color = proto_colors.get(str(proto).lower()) if proto_colors else None
         if color is None and proto_colors is not None:
             missing_color = True

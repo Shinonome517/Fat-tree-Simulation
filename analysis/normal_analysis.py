@@ -199,6 +199,10 @@ def _proto_color(proto: str) -> str:
     return PROTO_COLORS.get(str(proto).lower(), "tab:blue")
 
 
+def _proto_label(proto: str) -> str:
+    return str(proto).upper()
+
+
 def _darken_color(color: str, factor: float = 0.8) -> tuple[float, float, float, float]:
     rgba = mcolors.to_rgba(color)
     return (rgba[0] * factor, rgba[1] * factor, rgba[2] * factor, rgba[3])
@@ -232,6 +236,7 @@ def plot_mouse_fct_cdf(
         if subset.empty:
             logging.warning("No mouse FCT data for %s", proto)
             continue
+        display_proto = _proto_label(proto)
         values_all = subset["fct_s"].to_numpy()
         if values_all.size == 0:
             continue
@@ -248,7 +253,7 @@ def plot_mouse_fct_cdf(
         if values.size == 0:
             logging.warning("No mouse FCT values <= p99 for %s", proto)
             continue
-        label = proto if not exclude_outliers else f"{proto} (<=p99)"
+        label = display_proto if not exclude_outliers else f"{display_proto} (<=p99)"
         line_color = _proto_color(proto)
         line = _plot_cdf(ax, values * scale, label, color=line_color)
         color = line.get_color()
@@ -262,9 +267,9 @@ def plot_mouse_fct_cdf(
                 marker="X",
                 s=40,
                 linewidths=1.0,
-                label=f"{proto} p50/p90/p99",
+                label=f"{display_proto} p50/p90/p99",
             )
-            line.set_label(f"{proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
+            line.set_label(f"{display_proto} (p50={p50:.3f}, p90={p90:.3f}, p99={p99:.3f})")
             if mark_outliers:
                 sort_idx = np.argsort(values_all)
                 values_sorted = values_all[sort_idx]
@@ -285,7 +290,7 @@ def plot_mouse_fct_cdf(
                         marker="o",
                         s=24,
                         linewidth=1.0,
-                        label=f"{proto} outliers (no retrans)",
+                        label=f"{display_proto} outliers (no retrans)",
                     )
                 if np.any(has_retrans_mask):
                     retrans_color = _darken_color(color, factor=0.75)
@@ -297,7 +302,7 @@ def plot_mouse_fct_cdf(
                         marker="s",
                         s=24,
                         linewidth=0.8,
-                        label=f"{proto} outliers (retrans)",
+                        label=f"{display_proto} outliers (retrans)",
                     )
         has_data = True
 
@@ -862,7 +867,7 @@ def main() -> None:
             else:
                 droploss_summaries.append(
                     droploss.DropLossSummary(
-                        label=proto,
+                        label=_proto_label(proto),
                         run_dir=runs[-1],
                         drop_flows=drop_flows,
                         total_flows=drop_total,
@@ -878,7 +883,7 @@ def main() -> None:
             else:
                 retrans_summaries.append(
                     retrans.RetransSummary(
-                        label=proto,
+                        label=_proto_label(proto),
                         run_dir=runs[-1],
                         retrans_flows=retrans_flows,
                         total_flows=retrans_total,
