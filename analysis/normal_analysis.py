@@ -188,9 +188,17 @@ def setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
 
 
-def _plot_cdf(ax, values: np.ndarray, label: str, color: str | None = None):
+def _plot_cdf(
+    ax,
+    values: np.ndarray,
+    label: str,
+    color: str | None = None,
+    *,
+    total_count: int | None = None,
+):
     values = np.sort(values)
-    y = np.arange(1, len(values) + 1) / len(values)
+    denom = total_count if total_count is not None else len(values)
+    y = np.arange(1, len(values) + 1) / denom if denom else np.zeros(len(values))
     (line,) = ax.step(values, y, where="post", label=label, color=color)
     return line
 
@@ -244,18 +252,26 @@ def plot_mouse_fct_cdf(
             had_retrans_all = subset["had_retrans"].to_numpy().astype(bool)
         else:
             had_retrans_all = np.zeros(values_all.shape, dtype=bool)
+        total_count: int | None = None
         if exclude_outliers:
-            p99_threshold = np.percentile(values_all, 99)
-            values = values_all[values_all <= p99_threshold]
+            total_count = values_all.size
+            keep = int(np.floor(0.99 * total_count))
+            values = np.sort(values_all)[:keep] if keep > 0 else np.array([])
         else:
             outlier_mask, lower, upper = _outlier_mask(values_all)
             values = values_all
         if values.size == 0:
-            logging.warning("No mouse FCT values <= p99 for %s", proto)
+            logging.warning("No mouse FCT values after p99 filtering for %s", proto)
             continue
         label = display_proto if not exclude_outliers else f"{display_proto} (<=p99)"
         line_color = _proto_color(proto)
-        line = _plot_cdf(ax, values * scale, label, color=line_color)
+        line = _plot_cdf(
+            ax,
+            values * scale,
+            label,
+            color=line_color,
+            total_count=total_count,
+        )
         color = line.get_color()
         if not exclude_outliers:
             p50, p90, p99 = np.percentile(values * scale, [50, 90, 99])
